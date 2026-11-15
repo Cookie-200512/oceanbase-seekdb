@@ -211,6 +211,39 @@ public:
   int create_unnest_table_item(TableItem *&table_item, ObString table_name);
   int unnest_table_add_column(TableItem *&table_item, ColumnItem *&col_item, ObString col_name);
   int resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item);
+  int resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item);
+  int check_file_sql_enabled(bool &enabled) const;
+  int check_file_table_params(int64_t func_kind, const ParseNode *param_node,
+                              ObFileTableDef *file_def) const;
+  int check_file_table_path(common::ObString file_path, common::ObString &real_path) const;
+  // One CSV column of the resolver probe. type_level_ is a FILE_SQL_TYPE_LEVEL_* index, i.e. the
+  // narrowest ladder type that still fits every value sampled from that column.
+  struct FileSqlColumnSample
+  {
+    FileSqlColumnSample() : type_level_(0), seen_null_(false) {}
+    int32_t type_level_;
+    bool seen_null_;
+    TO_STRING_KV(K_(type_level), K_(seen_null));
+  };
+  int read_file_prefix(const common::ObString &real_path, const int64_t offset, char *buf,
+                       const int64_t buf_size, int64_t &read_len, bool &is_eof) const;
+  int scan_prefix_rows(const common::ObString &real_path, const ObFileTableDef &file_def,
+                       common::ObIAllocator &alloc, int64_t &col_cnt,
+                       common::ObIArray<FileSqlColumnSample> &samples,
+                       common::ObIArray<common::ObString> &row_names) const;
+  // Same probe for a newline delimited json file, where the columns are the union of the keys.
+  int scan_prefix_json_rows(const common::ObString &real_path, const ObFileTableDef &file_def,
+                            common::ObIAllocator &alloc, int64_t &col_cnt,
+                            common::ObIArray<FileSqlColumnSample> &samples,
+                            common::ObIArray<common::ObString> &row_names) const;
+  int infer_csv_types(const int64_t col_cnt, const bool skip_first_row,
+                      const common::ObIArray<int64_t> &field_cnts,
+                      const common::ObIArray<common::ObString> &values,
+                      const common::ObIArray<bool> &is_nulls,
+                      common::ObIArray<FileSqlColumnSample> &samples) const;
+  int make_unique_col_name(const common::ObString &raw_name, common::ObIAllocator &alloc,
+                           common::ObIArray<common::ObString> &taken_names,
+                           common::ObString &final_name) const;
 
   int fill_same_column_to_using(JoinedTable* &joined_table);
   int get_columns_from_table_item(const TableItem *table_item, common::ObIArray<common::ObString> &column_names);

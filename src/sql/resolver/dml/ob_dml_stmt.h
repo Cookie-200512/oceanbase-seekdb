@@ -129,6 +129,41 @@ struct ObValuesTableDef {
                        K(access_type_), K(is_const_), K(column_types_));
 };
 
+// Resolved description of a file table function (read_csv/read_json/read_parquet).
+// Field names and types match the engine side ObFileTableParams one by one so that code
+// generation can copy them directly. POD only, no raw expr and no owned buffer: the file path
+// travels as TableItem::function_table_expr_, a const expr of the resolved real path.
+struct ObFileTableDef {
+  ObFileTableDef()
+    : file_format_(0), parse_header_(true), skip_header_lines_(1), field_term_(','),
+      line_term_('\n'), enclosed_char_('"'), escaped_char_(INT64_MAX), sample_row_limit_(100),
+      inferred_column_count_(0), column_names_(), column_nulls_() {}
+  int64_t file_format_;            // 0: csv, 1: jsonl, 2: parquet
+  bool parse_header_;              // read_csv names the columns from the first line unless the
+                                   // query says otherwise, which is what the fixtures expect
+  int64_t skip_header_lines_;
+  int64_t field_term_;             // delimiter char code, INT64_MAX means unset
+  int64_t line_term_;
+  int64_t enclosed_char_;
+  int64_t escaped_char_;
+  int64_t sample_row_limit_;       // -1 means probe the whole file
+  int64_t inferred_column_count_;  // column count probed by the resolver
+  // The inferred column names, every name followed by one '\0', in the order the resolver
+  // registered them. A jsonl row names its values instead of ordering them, so the executor has to
+  // look a column up by name and the names therefore have to reach the spec. It is one flat string
+  // rather than an array because this struct is copied by assignment into the table item and is
+  // never destructed, so it may own no buffer of its own; the bytes live in the resolver allocator
+  // for as long as the statement does. Empty for a csv, whose columns are already positional.
+  common::ObString column_names_;
+  // One byte per inferred column, in the order of column_names_, and non zero where the probe saw a
+  // value the file does not carry. DESCRIBE has to report it, and a file table has no column schema
+  // to read it back from once the resolver built the column items.
+  common::ObString column_nulls_;
+  TO_STRING_KV(K_(file_format), K_(parse_header), K_(skip_header_lines), K_(field_term),
+               K_(line_term), K_(enclosed_char), K_(escaped_char), K_(sample_row_limit),
+               K_(inferred_column_count), K_(column_names), K_(column_nulls));
+};
+
 struct TableItem
 {
   TableItem()
@@ -153,6 +188,7 @@ struct TableItem
     ddl_schema_version_ = 0;
     ddl_table_id_ = common::OB_INVALID_ID;
     json_table_def_ = nullptr;
+    file_table_def_ = nullptr;
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
     sample_info_ = nullptr;
@@ -223,6 +259,8 @@ struct TableItem
   bool is_joined_table() const { return JOINED_TABLE == type_; }
   bool is_function_table() const { return FUNCTION_TABLE == type_; }
   bool is_json_table() const { return JSON_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
+  // a file table is planned as a function table, file_table_def_ tells the two apart
+  bool is_file_table() const { return NULL != file_table_def_; }
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
 
   bool is_lateral_table() const { return LATERAL_TABLE == type_; }
@@ -259,7 +297,9 @@ struct TableItem
   }
 
   ObJsonTableDef* get_json_table_def() { return json_table_def_; }
+  ObFileTableDef* get_file_table_def() { return file_table_def_; }
   int deep_copy_json_table_def(const ObJsonTableDef& jt_def, ObIRawExprCopier &expr_copier, ObIAllocator* allocator);
+  int deep_copy_file_table_def(const ObFileTableDef &file_def, ObIAllocator *allocator);
   int deep_copy_values_table_def(const ObValuesTableDef& table_def,
                                  ObIRawExprCopier &expr_copier,
                                  ObIAllocator* allocator);
@@ -301,6 +341,8 @@ struct TableItem
   common::ObSEArray<ObExecParamRawExpr*, 4, common::ModulePageAllocator, true> exec_params_;
   // json table
   ObJsonTableDef *json_table_def_;
+  // file table, e.g. read_csv/read_json, NULL for every other table item
+  ObFileTableDef *file_table_def_;
   // values table
   ObValuesTableDef *values_table_def_;
   // sample scan infos

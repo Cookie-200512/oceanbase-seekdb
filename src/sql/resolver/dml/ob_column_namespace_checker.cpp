@@ -312,6 +312,22 @@ int ObColumnNamespaceChecker::check_column_exists(const TableItem &table_item, c
     if (OB_FAIL(params_.schema_checker_->check_column_exists(
         table_id, col_name, is_exist))) {
     }
+  } else if (table_item.is_file_table()) {
+    // A file table has already registered one column item per inferred column while its table item
+    // was resolved, so the statement is the only namespace its columns live in. The function table
+    // branch below cannot help: it only knows UDT results. A miss leaves is_exist false and ret
+    // successful, so the caller reports the unknown column instead of an internal error.
+    if (OB_ISNULL(dml_stmt_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const common::ObIArray<ColumnItem> &column_items = dml_stmt_->get_column_items();
+      for (int64_t i = 0; !is_exist && i < column_items.count(); ++i) {
+        if (column_items.at(i).table_id_ == table_item.table_id_
+            && ObCharset::case_insensitive_equal(column_items.at(i).column_name_, col_name)) {
+          is_exist = true;
+        }
+      }
+    }
   } else if (table_item.is_function_table()) {
     if (OB_FAIL(ObResolverUtils::check_function_table_column_exist(table_item,
                                                                    params_,
