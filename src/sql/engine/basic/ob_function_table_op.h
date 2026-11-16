@@ -38,7 +38,7 @@ struct ObFileTableParams
 {
   ObFileTableParams()
     : file_format_(0), parse_header_(true), skip_header_lines_(1), field_term_(','),
-      line_term_('\n'), enclosed_char_('"'), escaped_char_(INT64_MAX), sample_row_limit_(100),
+      line_term_('\n'), enclosed_char_('"'), escaped_char_(INT64_MAX), sample_row_limit_(-1),
       inferred_column_count_(0)
   {}
   OB_UNIS_VERSION(1);

@@ -4729,7 +4729,20 @@ int ObDMLResolver::infer_csv_types(const int64_t col_cnt,
               }
             }
           }
-          if (level > sample.type_level_) {
+          // rungs of one family still share a narrow type, so only a number beside a date is
+          // forced all the way back to varchar
+          const int64_t kept = sample.type_level_;
+          const bool numeric = level >= FILE_SQL_TYPE_LEVEL_BIGINT
+              && level <= FILE_SQL_TYPE_LEVEL_DOUBLE;
+          const bool temporal = level >= FILE_SQL_TYPE_LEVEL_DATE
+              && level <= FILE_SQL_TYPE_LEVEL_DATETIME;
+          const bool kept_numeric = kept >= FILE_SQL_TYPE_LEVEL_BIGINT
+              && kept <= FILE_SQL_TYPE_LEVEL_DOUBLE;
+          const bool kept_temporal = kept >= FILE_SQL_TYPE_LEVEL_DATE
+              && kept <= FILE_SQL_TYPE_LEVEL_DATETIME;
+          if ((numeric && kept_temporal) || (temporal && kept_numeric)) {
+            sample.type_level_ = FILE_SQL_TYPE_LEVEL_VARCHAR;
+          } else if (level > kept) {
             sample.type_level_ = level;
           }
         }
@@ -4889,6 +4902,11 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     LOG_WARN("file table scan is not implemented yet", K(ret), K(file_path), K(parse_tree.value_));
   } else {
     ObDMLStmt *stmt = get_stmt();
+    // a cached plan would skip the gate, the path check and the probe, all of them resolver time
+    if (OB_NOT_NULL(stmt) && OB_NOT_NULL(stmt->get_query_ctx())) {
+      stmt->get_query_ctx()->get_query_hint_for_update().get_global_hint()
+          .merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+    }
     TableItem *item = NULL;
     ObConstRawExpr *path_expr = NULL;
     ObSEArray<FileSqlColumnSample, 16> samples;

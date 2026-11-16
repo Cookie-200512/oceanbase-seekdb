@@ -3087,6 +3087,12 @@ int ObSelectResolver::resolve_into_copy_file(const ParseNode *node, ObSelectInto
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected copy option node", K(ret), K(opt_node->type_));
   } else {
+    // the gate, the path check and the options below are decided while resolving, so the plan of a
+    // session that ran with enable_file_sql on must not be reused once that switch is off
+    if (OB_NOT_NULL(get_stmt()) && OB_NOT_NULL(get_stmt()->get_query_ctx())) {
+      get_stmt()->get_query_ctx()->get_query_hint_for_update().get_global_hint()
+          .merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+    }
     into_item.outfile_name_.set_varchar(real_path);
     into_item.outfile_name_.set_collation_type(ObCharset::get_system_collation());
     into_item.field_str_.set_varchar(",");

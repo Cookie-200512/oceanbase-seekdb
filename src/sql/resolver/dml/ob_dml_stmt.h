@@ -136,7 +136,7 @@ struct ObValuesTableDef {
 struct ObFileTableDef {
   ObFileTableDef()
     : file_format_(0), parse_header_(true), skip_header_lines_(1), field_term_(','),
-      line_term_('\n'), enclosed_char_('"'), escaped_char_(INT64_MAX), sample_row_limit_(100),
+      line_term_('\n'), enclosed_char_('"'), escaped_char_(INT64_MAX), sample_row_limit_(-1),
       inferred_column_count_(0), column_names_(), column_nulls_() {}
   int64_t file_format_;            // 0: csv, 1: jsonl, 2: parquet
   bool parse_header_;              // read_csv names the columns from the first line unless the
