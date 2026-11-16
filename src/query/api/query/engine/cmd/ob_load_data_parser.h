@@ -902,6 +902,20 @@ int ObCSVGeneralParser::scan_utf8_ex(const char *&str,
   return ret;
 }
 
+// Shared by file_sql resolver and executor. One newline delimited json object becomes the same
+// (name, text, is_null) shape a csv row has: a json number, boolean or null is turned into the text
+// a csv would have carried ("98.5", "true"), a missing or json null value becomes is_null, and an
+// object or array value is refused because a file table column cannot hold it. names, texts and
+// is_nulls are appended in the order the members appear in the line, so the caller can build the
+// union column list from the first pass and map every later row onto it by name. Everything the
+// returned ObStrings point at comes from alloc, which the caller owns and may reset once the row is
+// consumed.
+int file_sql_json_line_to_fields(common::ObIAllocator &alloc,
+                                 const common::ObString &line,
+                                 common::ObIArray<common::ObString> &names,
+                                 common::ObIArray<common::ObString> &texts,
+                                 common::ObIArray<bool> &is_nulls);
+
 // Preserve the original text of user-specified file format options.
 struct ObOriginFileFormat
 {

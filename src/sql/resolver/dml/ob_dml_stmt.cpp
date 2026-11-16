@@ -158,6 +158,22 @@ int TableItem::deep_copy_json_table_def(const ObJsonTableDef& jt_def, ObIRawExpr
   return ret;
 }
 
+int TableItem::deep_copy_file_table_def(const ObFileTableDef &file_def, ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  ObFileTableDef *tmp_file_def = nullptr;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(tmp_file_def = static_cast<ObFileTableDef *>(allocator->alloc(sizeof(ObFileTableDef))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    // plain POD, the path itself lives in the copied function table expression
+    file_table_def_ = new (tmp_file_def) ObFileTableDef();
+    *file_table_def_ = file_def;
+  }
+  return ret;
+}
+
 int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
                          const TableItem &other,
                          ObIAllocator* allocator)
@@ -186,7 +202,11 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   ddl_table_id_ = other.ddl_table_id_;
   ref_query_ = other.ref_query_;
   SampleInfo *buf = NULL;
-  if (is_json_table() 
+  // keyed on the source: this->file_table_def_ is still null until the copy below fills it
+  if (other.is_file_table()
+      && OB_FAIL(deep_copy_file_table_def(*other.file_table_def_, allocator))) {
+    LOG_WARN("failed to copy the file table def", K(ret), K(other.table_id_));
+  } else if (is_json_table() 
       && OB_FAIL(deep_copy_json_table_def(*other.json_table_def_, expr_copier, allocator))) {
   } else if (OB_FAIL(expr_copier.copy(other.snapshot_query_expr_, snapshot_query_expr_))) {
   } else if (OB_FAIL(expr_copier.copy(other.function_table_expr_, function_table_expr_))) {

@@ -41,6 +41,7 @@
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
+#include "sql/engine/cmd/ob_load_data_parser.h"
 
 namespace oceanbase
 {
@@ -2719,6 +2720,13 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         }
         break;
       }
+      case T_FILE_TABLE_EXPRESSION: {
+        if (OB_ISNULL(session_info_)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (OB_FAIL(resolve_file_table_item(*table_node, table_item))) {
+        }
+        break;
+      }
       case T_VALUES_TABLE_EXPRESSION: {
         if (OB_FAIL(resolve_values_table_item(*table_node, table_item))) {
         }
@@ -3762,6 +3770,1229 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
 
   if (OB_SUCC(ret) && OB_NOT_NULL(params_.query_ctx_)) {
     params_.query_ctx_->has_hybrid_search_ = true;
+  }
+  return ret;
+}
+
+// Kind values written by the file_table_expr rules in sql_parser_mysql_mode.y.
+enum ObFileTableFuncKind
+{
+  FILE_SQL_READ_CSV = 0,
+  FILE_SQL_READ_JSON = 1,
+  FILE_SQL_READ_PARQUET = 2,
+  FILE_SQL_GLOB = 3,
+};
+
+// Type ladder the resolver probe runs a CSV column through. A column keeps the narrowest level
+// that fits every sampled value, so the highest level seen in the column wins. BOOLEAN is the
+// narrowest because a true/false or 0/1 column must not widen to BIGINT, and VARCHAR is the
+// fall back for anything the other levels reject.
+enum ObFileSqlTypeLevel
+{
+  FILE_SQL_TYPE_LEVEL_BOOLEAN = 0,
+  FILE_SQL_TYPE_LEVEL_BIGINT = 1,
+  FILE_SQL_TYPE_LEVEL_DOUBLE = 2,
+  FILE_SQL_TYPE_LEVEL_DATE = 3,
+  FILE_SQL_TYPE_LEVEL_DATETIME = 4,
+  FILE_SQL_TYPE_LEVEL_VARCHAR = 5,
+  FILE_SQL_TYPE_LEVEL_COUNT = 6
+};
+
+// Object type of each ladder level. BOOLEAN becomes TINYINT, which is how a MySQL BOOLEAN column
+// is stored, so the values print as 1 and 0.
+static const ObObjType FILE_SQL_LEVEL_TYPES[] = {
+    ObTinyIntType, ObIntType, ObDoubleType, ObDateType, ObDateTimeType, ObVarcharType};
+
+// The probe never holds more of the file than one buffer, and the CSV parser only returns whole
+// rows, so a row that does not fit in this buffer cannot be sampled.
+static const int64_t FILE_SQL_PROBE_CHUNK_SIZE = 64 * 1024;
+
+static inline bool file_sql_is_digit(char c) { return c >= '0' && c <= '9'; }
+
+static inline bool file_sql_is_sign(char c) { return '-' == c || '+' == c; }
+
+// The casts of the SQL layer are too lenient to use as a type test: '2026-08-01' casts to the
+// double 2026 and 'Alice' casts to 0. Every level therefore first matches the whole field against
+// a shape and only then asks a converter whether the value is really representable.
+static bool file_sql_is_bool_shape(const ObString &value)
+{
+  return (1 == value.length() && ('0' == value.ptr()[0] || '1' == value.ptr()[0]))
+         || (4 == value.length() && 0 == value.case_compare("true"))
+         || (5 == value.length() && 0 == value.case_compare("false"));
+}
+
+static bool file_sql_is_int_shape(const ObString &value)
+{
+  bool is_int = false;
+  int64_t i = (!value.empty() && file_sql_is_sign(value.ptr()[0])) ? 1 : 0;
+  while (i < value.length() && file_sql_is_digit(value.ptr()[i])) { ++i; }
+  if (i > 0 && i == value.length()) {
+    char *end_ptr = NULL;
+    int err = 0;
+    // strntoll reports ERANGE instead of clamping, which is what separates a BIGINT column from
+    // a column of digit strings that happen not to fit.
+    (void)ObCharset::strntoll(value.ptr(), value.length(), 10, &end_ptr, &err);
+    is_int = (0 == err && value.ptr() + i == end_ptr);
+  }
+  return is_int;
+}
+
+static bool file_sql_is_double_shape(const ObString &value)
+{
+  bool is_double = false;
+  int64_t i = (!value.empty() && file_sql_is_sign(value.ptr()[0])) ? 1 : 0;
+  int64_t first = i;
+  int64_t digits = 0;
+  while (i < value.length() && file_sql_is_digit(value.ptr()[i])) { ++i; }
+  digits = i - first;
+  if (i < value.length() && '.' == value.ptr()[i]) {
+    ++i;
+    first = i;
+    while (i < value.length() && file_sql_is_digit(value.ptr()[i])) { ++i; }
+    digits += i - first;
+  }
+  if (digits > 0 && i < value.length() && ('e' == value.ptr()[i] || 'E' == value.ptr()[i])) {
+    ++i;
+    if (i < value.length() && file_sql_is_sign(value.ptr()[i])) { ++i; }
+    first = i;
+    while (i < value.length() && file_sql_is_digit(value.ptr()[i])) { ++i; }
+    if (i == first) { digits = -1; }  // "1e" is not a number
+  }
+  if (digits > 0 && i == value.length()) {
+    char *end_ptr = NULL;
+    int err = 0;
+    (void)ObCharset::strntodv2(value.ptr(), value.length(), &end_ptr, &err);
+    is_double = (0 == err && value.ptr() + i == end_ptr);
+  }
+  return is_double;
+}
+
+// Only the dashed form is a date here. An undashed 20260801 is a number, and reading it as a
+// date would silently rewrite the column type of any id-like field.
+static bool file_sql_is_date_shape(const ObString &value)
+{
+  bool is_date = false;
+  if (10 == value.length() && '-' == value.ptr()[4] && '-' == value.ptr()[7]) {
+    int64_t i = 0;
+    for (i = 0; i < 4 && file_sql_is_digit(value.ptr()[i]); ++i) {}
+    is_date = (4 == i);
+    if (is_date) {
+      for (i = 5; i < 7 && file_sql_is_digit(value.ptr()[i]); ++i) {}
+      is_date = (7 == i);
+    }
+    if (is_date) {
+      for (i = 8; i < 10 && file_sql_is_digit(value.ptr()[i]); ++i) {}
+      is_date = (10 == i);
+    }
+  }
+  return is_date;
+}
+
+// 'T' is accepted as the date/time separator because the test suite's created column uses both
+// the spaced and the T form of the same value.
+static bool file_sql_is_datetime_shape(const ObString &value)
+{
+  bool is_datetime = false;
+  if (value.length() >= 19 && (' ' == value.ptr()[10] || 'T' == value.ptr()[10])
+      && '-' == value.ptr()[4] && '-' == value.ptr()[7]) {
+    int64_t i = 11;
+    for (i = 11; i < 13 && file_sql_is_digit(value.ptr()[i]); ++i) {}
+    is_datetime = (13 == i && ':' == value.ptr()[13]);
+    if (is_datetime) {
+      for (i = 14; i < 16 && file_sql_is_digit(value.ptr()[i]); ++i) {}
+      is_datetime = (16 == i && ':' == value.ptr()[16]);
+    }
+    if (is_datetime) {
+      for (i = 17; i < 19 && file_sql_is_digit(value.ptr()[i]); ++i) {}
+      is_datetime = (19 == i);
+    }
+    if (is_datetime && value.length() > 19) {
+      // optional fractional seconds, up to the microsecond precision of ObDateTimeType
+      int64_t frac = 0;
+      if ('.' != value.ptr()[19]) {
+        is_datetime = false;
+      } else {
+        for (i = 20; i < value.length() && file_sql_is_digit(value.ptr()[i]); ++i, ++frac) {}
+        is_datetime = (frac > 0 && frac <= 6 && i == value.length());
+      }
+    }
+  }
+  return is_datetime;
+}
+
+// A header written as "id, name" carries the space that separates it from the value columns; the
+// parser keeps the field verbatim, so the names get the surrounding blanks removed here.
+static inline void file_sql_trim(ObString &value)
+{
+  int64_t begin = 0;
+  int64_t end = value.length();
+  while (begin < end && (' ' == value.ptr()[begin] || '\t' == value.ptr()[begin])) { ++begin; }
+  while (end > begin && (' ' == value.ptr()[end - 1] || '\t' == value.ptr()[end - 1]
+                         || '\r' == value.ptr()[end - 1])) { --end; }
+  value.assign_ptr(value.ptr() + begin, static_cast<int32_t>(end - begin));
+}
+
+int ObDMLResolver::check_file_sql_enabled(bool &enabled) const
+{
+  int ret = OB_SUCCESS;
+  int64_t enable_file_sql = 0;
+  enabled = false;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null session info", K(ret));
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
+    LOG_WARN("failed to get system variable enable_file_sql", K(ret));
+  } else {
+    enabled = (0 != enable_file_sql);
+  }
+  return ret;
+}
+
+// Only the parameters written in the file_sql test suite are accepted, and only with the value
+// the suite uses. Everything else is reported as not supported instead of guessing a meaning.
+// merge_nodes flattens the T_LINK_NODE chains, so children_ is a flat name/value list, the same
+// shape T_VEC_INDEX_PARAMS has (see ObVectorIndexUtil::check_index_param).
+// file_def receives what the accepted values mean; a caller that only validates may pass NULL.
+int ObDMLResolver::check_file_table_params(int64_t func_kind, const ParseNode *param_node,
+                                           ObFileTableDef *file_def) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(param_node) && T_EXPR_LIST != param_node->type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected file table param node", K(ret), K(param_node->type_));
+  } else if (OB_NOT_NULL(param_node) && 0 != (param_node->num_child_ % 2)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected file table param count", K(ret), K(param_node->num_child_));
+  } else if (OB_NOT_NULL(file_def)) {
+    file_def->file_format_ = func_kind;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && OB_NOT_NULL(param_node) && i < param_node->num_child_; i += 2) {
+    const ParseNode *name_node = param_node->children_[i];
+    const ParseNode *value_node = param_node->children_[i + 1];
+    ObString name;
+    ObString value;
+    if (OB_ISNULL(name_node) || OB_ISNULL(value_node)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null file table param node", K(ret), K(i));
+    } else if (OB_ISNULL(name_node->str_value_) || name_node->str_len_ <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid file table param name", K(ret), K(i));
+    } else if (OB_FALSE_IT(name.assign_ptr(name_node->str_value_, static_cast<int32_t>(name_node->str_len_)))) {
+    } else if (0 == name.case_compare("header")) {
+      if (T_BOOL != value_node->type_) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid header value", K(ret), K(name), K(value_node->type_));
+      } else if (OB_NOT_NULL(file_def)) {
+        file_def->parse_header_ = (0 != value_node->value_);
+        // Same convention as ObResolverUtils::check_external_table_format_csv: the first line is
+        // consumed by the skip counter, not by the scan. Nothing in the load data scan path reads
+        // it, so the file table code has to honour it itself.
+        file_def->skip_header_lines_ = file_def->parse_header_ ? 1 : 0;
+      }
+    } else if (0 == name.case_compare("sample_size")) {
+      if (T_INT != value_node->type_) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid sample_size value", K(ret), K(name), K(value_node->type_));
+      } else if (-1 != value_node->value_) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading only part of a file");
+        LOG_WARN("sample_size other than -1 is not implemented", K(ret), K(name),
+                 K(value_node->value_), K(func_kind));
+      } else if (OB_NOT_NULL(file_def)) {
+        file_def->sample_row_limit_ = -1;
+      }
+    } else if (0 == name.case_compare("format")) {
+      if (T_VARCHAR != value_node->type_ && T_CHAR != value_node->type_) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid format value", K(ret), K(name), K(value_node->type_));
+      } else if (OB_ISNULL(value_node->str_value_)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("null format value", K(ret), K(name));
+      } else if (OB_FALSE_IT(value.assign_ptr(value_node->str_value_,
+                                              static_cast<int32_t>(value_node->str_len_)))) {
+      } else if (FILE_SQL_READ_JSON != func_kind || 0 != value.case_compare("newline_delimited")) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file format");
+        LOG_WARN("file format is not implemented", K(ret), K(value), K(func_kind));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file table function parameter");
+      LOG_WARN("unsupported file table param", K(ret), K(name), K(func_kind));
+    }
+  }
+  return ret;
+}
+
+// Follows ObSelectIntoOp::check_secure_file_path: the prefix test runs on the resolved directory
+// of the path, so a not yet existing target file or a glob pattern can still pass it. The leaf
+// entry itself is neither stat'ed nor opened here, it is only appended back to the resolved
+// directory so that the caller gets one canonical, NUL terminated name to hand to fopen.
+int ObDMLResolver::check_file_table_path(ObString file_path, ObString &real_path) const
+{
+  int ret = OB_SUCCESS;
+  static const int64_t FILE_SQL_PATH_BUF_SIZE = 4096;
+  const char *slash = file_path.reverse_find('/');
+  ObString dir_path;
+  ObString file_name;
+  char full_path_buf[FILE_SQL_PATH_BUF_SIZE + 1];
+  char *actual_path = NULL;
+  ObString secure_file_priv;
+  ObSqlString sql_str;
+  real_path.reset();
+  if (NULL != slash) {
+    dir_path.assign_ptr(file_path.ptr(), static_cast<int32_t>(slash - file_path.ptr()));
+    file_name.assign_ptr(slash + 1,
+                         static_cast<int32_t>(file_path.length() - (slash + 1 - file_path.ptr())));
+    if (dir_path.empty()) {
+      // "/x.csv" lives in the root directory, not in the current one
+      dir_path.assign_ptr("/", 1);
+    }
+  }
+  if (OB_FAIL(sql_str.append(dir_path.empty() ? "." : dir_path))) {
+    LOG_WARN("failed to append dir path", K(ret), K(file_path));
+#ifdef _WIN32
+  } else if (NULL == (actual_path = _fullpath(full_path_buf, sql_str.ptr(), sizeof(full_path_buf)))) {
+#else
+  } else if (NULL == (actual_path = realpath(sql_str.ptr(), full_path_buf))) {
+#endif
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("failed to get the real path of the file", K(ret), K(file_path));
+  } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+    LOG_WARN("failed to get secure_file_priv", K(ret));
+  } else if (!session_info_->is_inner()
+             && OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, actual_path))) {
+    LOG_WARN("file path is rejected by secure_file_priv", K(ret), K(secure_file_priv), K(file_path));
+  } else if (file_name.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("file name is empty", K(ret), K(file_path));
+  } else {
+    const int64_t dir_len = STRLEN(actual_path);
+    const int64_t total = dir_len + 1 + file_name.length();
+    char *buf = NULL;
+    if (OB_UNLIKELY(total > FILE_SQL_PATH_BUF_SIZE)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("file path is too long", K(ret), K(file_path), K(total));
+    } else if (OB_ISNULL(allocator_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("allocator is null", K(ret));
+    } else if (OB_ISNULL(buf = static_cast<char *>(allocator_->alloc(total + 1)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc real path", K(ret), K(total));
+    } else {
+      // +1 for the '/' and one more for the terminator the parser and the executor fopen() with
+      MEMCPY(buf, actual_path, dir_len);
+      buf[dir_len] = '/';
+      MEMCPY(buf + dir_len + 1, file_name.ptr(), file_name.length());
+      buf[total] = '\0';
+      real_path.assign_ptr(buf, static_cast<int32_t>(total));
+    }
+  }
+  return ret;
+}
+
+// Reads up to buf_size bytes of an already validated file starting at offset. The type probe never
+// holds more than one chunk of the file in memory, whatever the size of that file.
+int ObDMLResolver::read_file_prefix(const ObString &real_path, const int64_t offset, char *buf,
+                                    const int64_t buf_size, int64_t &read_len, bool &is_eof) const
+{
+  int ret = OB_SUCCESS;
+  FILE *fp = NULL;
+  read_len = 0;
+  is_eof = false;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(buf_size <= 0 || offset < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid read buffer", K(ret), KP(buf), K(buf_size), K(offset));
+  } else if (OB_ISNULL(fp = fopen(real_path.ptr(), "rb"))) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_USER_ERROR(OB_FILE_NOT_EXIST);
+    LOG_WARN("failed to open the file for the type probe", K(ret), K(real_path));
+  } else {
+    if (offset > 0 && 0 != fseek(fp, static_cast<long>(offset), SEEK_SET)) {
+      ret = OB_IO_ERROR;
+      LOG_WARN("failed to seek in the file", K(ret), K(real_path), K(offset));
+    } else {
+      const size_t n = fread(buf, 1, static_cast<size_t>(buf_size), fp);
+      read_len = static_cast<int64_t>(n);
+      is_eof = (n < static_cast<size_t>(buf_size));
+    }
+    fclose(fp);
+  }
+  return ret;
+}
+
+// ObCSVGeneralParser is templated on the handler and instantiates both call sites, so a probe
+// handler has to accept the one line and the batch form even though the batch form is never
+// reached with USE_HANDLE_BATCH_LINES = false.
+class FileSqlWidthHandler
+{
+public:
+  explicit FileSqlWidthHandler(int64_t &width) : width_(width) {}
+  int operator()(ObCSVGeneralParser::HandleOneLineParam param)
+  {
+    width_ = param.field_cnt_;
+    return OB_SUCCESS;
+  }
+  int operator()(ObCSVGeneralParser::HandleBatchLinesParam param)
+  {
+    UNUSED(param);
+    return OB_NOT_SUPPORTED;
+  }
+private:
+  int64_t &width_;
+};
+
+// Collects one chunk of rows as a flat row major matrix of col_cnt values. Fields past the probed
+// width are dropped and short rows are padded with NULLs, which is what handle_irregular_line does
+// for a real scan. The strings point into the read buffer and die with the chunk.
+class FileSqlValueHandler
+{
+public:
+  FileSqlValueHandler(const int64_t col_cnt, ObIArray<int64_t> &field_cnts,
+                      ObIArray<ObString> &values, ObIArray<bool> &is_nulls)
+    : col_cnt_(col_cnt), field_cnts_(field_cnts), values_(values), is_nulls_(is_nulls) {}
+  int operator()(ObCSVGeneralParser::HandleOneLineParam param)
+  {
+    int ret = OB_SUCCESS;
+    const int64_t real = param.field_cnt_ < col_cnt_ ? param.field_cnt_ : col_cnt_;
+    if (OB_FAIL(field_cnts_.push_back(real))) {
+      LOG_WARN("failed to record the field count", K(ret), K(real));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt_; ++i) {
+      const char *ptr = NULL;
+      int64_t len = 0;
+      bool is_null = true;
+      if (i < real) {
+        ptr = param.fields_.at(i).ptr_;
+        len = param.fields_.at(i).len_;
+        is_null = (0 != param.fields_.at(i).is_null_);
+        if (!is_null && len > 0 && '\r' == ptr[len - 1]) {
+          --len; // a CRLF file leaves the carriage return inside the last field
+        }
+      }
+      if (OB_FAIL(values_.push_back(is_null ? ObString() : ObString(static_cast<int32_t>(len), ptr)))) {
+        LOG_WARN("failed to record the field value", K(ret), K(i));
+      } else if (OB_FAIL(is_nulls_.push_back(is_null))) {
+        LOG_WARN("failed to record the null flag", K(ret), K(i));
+      }
+    }
+    return ret;
+  }
+  int operator()(ObCSVGeneralParser::HandleBatchLinesParam param)
+  {
+    UNUSED(param);
+    return OB_NOT_SUPPORTED;
+  }
+private:
+  int64_t col_cnt_;
+  ObIArray<int64_t> &field_cnts_;
+  ObIArray<ObString> &values_;
+  ObIArray<bool> &is_nulls_;
+};
+
+// One scan of the bytes currently held in the probe buffer. `pos` is advanced past the last
+// complete row, so the caller keeps [pos, end) and reads the next chunk behind it. `rows` is the
+// row budget in and the rows actually scanned out, as ObCSVGeneralParser::scan declares it.
+template <typename HandlerType>
+static int file_sql_scan_buffer(const ObFileTableDef &file_def, const int64_t column_nums,
+                                const char *&pos, const char *end, const bool is_end_file,
+                                HandlerType &handler, int64_t &rows)
+{
+  int ret = OB_SUCCESS;
+  sql::ObCSVGeneralParser parser;
+  sql::ObCSVGeneralFormat format;
+  ObSEArray<sql::ObCSVGeneralParser::LineErrRec, 8> err_records;
+  char field_term[2] = { static_cast<char>(file_def.field_term_), '\0' };
+  char line_term[2] = { static_cast<char>(file_def.line_term_), '\0' };
+  format.field_term_str_.assign_ptr(field_term, 1);
+  format.line_term_str_.assign_ptr(line_term, 1);
+  format.field_enclosed_char_ = file_def.enclosed_char_;
+  format.field_escaped_char_ = file_def.escaped_char_;
+  format.cs_type_ = common::CHARSET_UTF8MB4;
+  format.file_column_nums_ = column_nums;
+  format.skip_header_lines_ = 0;
+  format.parse_header_ = false;
+  // The probe only needs the shape of the values, so it must not fail on a ragged file: extra
+  // fields are dropped and an empty field is a NULL, which is also how the fixture spells nulls.
+  format.ignore_extra_fields_ = true;
+  format.empty_field_as_null_ = true;
+  if (OB_FAIL(parser.init(format))) {
+    LOG_WARN("failed to init csv parser", K(ret), K(column_nums), K(file_def));
+  } else if (OB_FAIL(parser.scan(pos, end, rows, NULL, NULL, handler, err_records, is_end_file))) {
+    LOG_WARN("failed to scan the probe buffer", K(ret), K(column_nums), K(rows));
+  }
+  return ret;
+}
+
+// The first sampled row of a file with a header names the columns. Those names point into the read
+// buffer, so they are trimmed and copied out before the buffer is refilled.
+static int copy_probe_header_names(ObIAllocator &alloc, const int64_t col_cnt,
+                                   const ObIArray<ObString> &values,
+                                   ObIArray<ObString> &row_names)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt && c < values.count(); ++c) {
+    ObString name = values.at(c);
+    ObString copied;
+    file_sql_trim(name);
+    if (OB_FAIL(ob_write_string(alloc, name, copied))) {
+      LOG_WARN("failed to copy the header name", K(ret), K(c));
+    } else if (OB_FAIL(row_names.push_back(copied))) {
+      LOG_WARN("failed to record the header name", K(ret), K(c));
+    }
+  }
+  return ret;
+}
+
+// Probes a CSV file and returns the column width, the per column type of the ladder and, when the
+// file carries a header, the raw names of that first row.
+int ObDMLResolver::scan_prefix_rows(const ObString &real_path, const ObFileTableDef &file_def,
+                                    ObIAllocator &alloc, int64_t &col_cnt,
+                                    ObIArray<FileSqlColumnSample> &samples,
+                                    ObIArray<ObString> &row_names) const
+{
+  int ret = OB_SUCCESS;
+  const int64_t buf_cap = FILE_SQL_PROBE_CHUNK_SIZE;
+  char *buf = NULL;
+  int64_t filled = 0;
+  int64_t file_off = 0;
+  bool is_eof = false;
+  col_cnt = 0;
+  samples.reset();
+  row_names.reset();
+  if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(buf_cap)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to alloc probe buffer", K(ret), K(buf_cap));
+  }
+  // Pass one: the parser needs the column count up front, so the rows are scanned with a single
+  // column and ignore_extra_fields_, which reports the real field count of each row. The first row
+  // with at least one field decides the width, which also skips a leading blank line.
+  while (OB_SUCC(ret) && col_cnt <= 0) {
+    int64_t read_len = 0;
+    if (filled >= buf_cap) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "a csv row longer than the type probe buffer");
+      LOG_WARN("no row boundary inside the probe buffer", K(ret), K(real_path), K(buf_cap));
+    } else if (OB_FAIL(read_file_prefix(real_path, file_off + filled, buf + filled,
+                                        buf_cap - filled, read_len, is_eof))) {
+      LOG_WARN("failed to read the file head", K(ret), K(real_path), K(filled));
+    } else if (FALSE_IT(filled += read_len)) {
+    } else if (filled <= 0) {
+      // an empty file has nothing to infer from
+      break;
+    } else {
+      const char *pos = buf;
+      const char *end = buf + filled;
+      int64_t rows = 1;
+      int64_t width = 0;
+      FileSqlWidthHandler width_handler(width);
+      if (OB_FAIL(file_sql_scan_buffer(file_def, 1, pos, end, is_eof, width_handler, rows))) {
+        LOG_WARN("failed to measure the first row", K(ret), K(real_path));
+      } else if (width > 0) {
+        col_cnt = width;
+      } else {
+        const int64_t keep = end - pos;
+        if (keep > 0) {
+          MEMMOVE(buf, pos, keep);
+        }
+        file_off += (pos - buf);
+        filled = keep;
+        if (filled <= 0 && is_eof) {
+          break;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && col_cnt <= 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a file without any row");
+    LOG_WARN("no complete row found for the type probe", K(ret), K(real_path));
+  }
+  // Pass two: stream the sampled rows and fold every chunk into the column states, so the buffer
+  // can be reused while sample_size asks for the whole file.
+  ObSEArray<int64_t, 16> field_cnts;
+  ObSEArray<ObString, 64> values;
+  ObSEArray<bool, 64> is_nulls;
+  int64_t rows_left = file_def.sample_row_limit_ < 0 ? INT64_MAX : file_def.sample_row_limit_;
+  bool need_header_row = file_def.parse_header_;
+  int64_t data_rows = 0;
+  filled = 0;
+  file_off = 0;
+  is_eof = false;
+  if (OB_SUCC(ret) && OB_FAIL(samples.prepare_allocate(col_cnt))) {
+    LOG_WARN("failed to prepare samples", K(ret), K(col_cnt));
+  }
+  while (OB_SUCC(ret) && rows_left > 0 && !(is_eof && filled <= 0)) {
+    int64_t read_len = 0;
+    if (filled >= buf_cap) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "a csv row longer than the type probe buffer");
+      LOG_WARN("no row boundary inside the probe buffer", K(ret), K(real_path), K(buf_cap));
+    } else if (OB_FAIL(read_file_prefix(real_path, file_off + filled, buf + filled,
+                                        buf_cap - filled, read_len, is_eof))) {
+      LOG_WARN("failed to read the file prefix", K(ret), K(real_path), K(file_off), K(filled));
+    } else {
+      FALSE_IT(filled += read_len);
+    }
+    if (OB_FAIL(ret) || filled <= 0) {
+      // nothing to parse in this chunk
+    } else {
+      const char *pos = buf;
+      const char *end = buf + filled;
+      int64_t rows = rows_left;
+      FileSqlValueHandler value_handler(col_cnt, field_cnts, values, is_nulls);
+      if (OB_FAIL(file_sql_scan_buffer(file_def, col_cnt, pos, end, is_eof, value_handler, rows))) {
+        LOG_WARN("failed to scan the file prefix", K(ret), K(real_path), K(col_cnt));
+      } else if (OB_FAIL(infer_csv_types(col_cnt, need_header_row, field_cnts, values, is_nulls,
+                                         samples))) {
+        LOG_WARN("failed to infer csv types", K(ret), K(col_cnt));
+      } else if (need_header_row && field_cnts.count() > 0
+                 && OB_FAIL(copy_probe_header_names(alloc, col_cnt, values, row_names))) {
+        LOG_WARN("failed to copy the header names", K(ret), K(col_cnt));
+      } else {
+        data_rows += field_cnts.count() - (need_header_row && field_cnts.count() > 0 ? 1 : 0);
+        need_header_row = false;
+        field_cnts.reuse();
+        values.reuse();
+        is_nulls.reuse();
+        rows_left -= rows;
+        const int64_t keep = end - pos;
+        if (keep > 0) {
+          MEMMOVE(buf, pos, keep);
+        }
+        file_off += (pos - buf);
+        filled = keep;
+        if (keep >= (end - buf) && is_eof) {
+          // the tail never becomes a row and no more bytes can arrive, so stop here
+          rows_left = 0;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && data_rows <= 0) {
+    // A file that only carries a header has no value to fit a narrow type to.
+    for (int64_t c = 0; OB_SUCC(ret) && c < samples.count(); ++c) {
+      samples.at(c).type_level_ = FILE_SQL_TYPE_LEVEL_VARCHAR;
+    }
+  }
+  if (OB_SUCC(ret) && !file_def.parse_header_ && row_names.count() <= 0) {
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+      char gen[32] = { '\0' };
+      ObString copied;
+      int64_t pos = 0;
+      if (OB_FAIL(databuff_printf(gen, sizeof(gen), pos, "column%02ld", c))) {
+        LOG_WARN("failed to build the column name", K(ret), K(c));
+      } else if (OB_FAIL(ob_write_string(alloc, ObString(static_cast<int32_t>(pos), gen),
+                                         copied))) {
+        LOG_WARN("failed to copy the column name", K(ret), K(c));
+      } else if (OB_FAIL(row_names.push_back(copied))) {
+        LOG_WARN("failed to record the column name", K(ret), K(c));
+      }
+    }
+  }
+  return ret;
+}
+
+// A json key is spelled the same way in the row that has to find it again, so the union and the
+// lookups compare bytes rather than the case folded spellings of a header line.
+static int64_t file_sql_find_name(const ObIArray<ObString> &names, const ObString &key)
+{
+  int64_t hit = -1;
+  for (int64_t i = 0; hit < 0 && i < names.count(); ++i) {
+    const ObString &name = names.at(i);
+    if (name.length() == key.length()
+        && (key.empty() || 0 == MEMCMP(name.ptr(), key.ptr(), key.length()))) {
+      hit = i;
+    }
+  }
+  return hit;
+}
+
+// Streams the rows of a newline delimited json file through one reusable buffer and hands every
+// line that is not blank to `handler`, so the probe never holds more of the file than a chunk even
+// when sample_size asks for the whole file. `rows` is the row budget in and the rows handed out
+// out; a blank line is neither a row nor a cost against the budget.
+template <typename HandlerType>
+static int file_sql_scan_json_rows(const ObDMLResolver &resolver, const ObString &real_path,
+                                   const int64_t buf_cap, const int64_t row_limit,
+                                   ObIAllocator &alloc, HandlerType &handler, int64_t &rows)
+{
+  int ret = OB_SUCCESS;
+  char *buf = NULL;
+  int64_t base = 0;     // absolute file offset of buf[0]
+  int64_t filled = 0;   // bytes held in buf
+  int64_t used = 0;     // bytes of buf already handed out
+  bool is_eof = false;
+  const int64_t budget = row_limit < 0 ? INT64_MAX : row_limit;
+  rows = 0;
+  if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(buf_cap)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to alloc the json probe buffer", K(ret), K(buf_cap));
+  }
+  while (OB_SUCC(ret) && rows < budget) {
+    int64_t nl = -1;
+    for (int64_t i = used; i < filled; ++i) {
+      if ('\n' == buf[i]) {
+        nl = i;
+        break;
+      }
+    }
+    if (nl < 0 && !is_eof) {
+      // no row boundary yet, so keep the unread tail in front of the next read
+      const int64_t keep = filled - used;
+      int64_t read_len = 0;
+      if (keep >= buf_cap) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "a json row longer than the type probe buffer");
+        LOG_WARN("no row boundary inside the probe buffer", K(ret), K(real_path), K(buf_cap));
+      } else {
+        if (used > 0) {
+          if (keep > 0) {
+            MEMMOVE(buf, buf + used, keep);
+          }
+          base += used;
+          filled = keep;
+          used = 0;
+        }
+        if (OB_FAIL(resolver.read_file_prefix(real_path, base + filled, buf + filled,
+                                              buf_cap - filled, read_len, is_eof))) {
+          LOG_WARN("failed to read the file prefix", K(ret), K(real_path), K(base), K(filled));
+        } else {
+          filled += read_len;
+        }
+      }
+    } else if (used >= filled) {
+      // the file is exhausted
+      break;
+    } else {
+      ObString line(static_cast<int32_t>((nl < 0 ? filled : nl) - used), buf + used);
+      used = (nl < 0) ? filled : nl + 1;
+      file_sql_trim(line);
+      if (line.empty()) {
+        // a blank line carries no row, which is also how a file ending in a newline closes
+      } else {
+        ++rows;
+        if (OB_FAIL(handler(line))) {
+          LOG_WARN("failed to handle the json row", K(ret), K(line), K(rows));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// First pass over a json file: the columns are the union of the keys in order of first appearance,
+// because a json row says the name of each value instead of its place. The keys live in the tree
+// the json parser built, so a name new to the union is copied to the statement allocator before
+// that tree is dropped.
+class FileSqlJsonNameHandler
+{
+public:
+  FileSqlJsonNameHandler(ObIAllocator &alloc, ObIArray<ObString> &names)
+    : stmt_alloc_(alloc), names_(names), scratch_("FileSqlJson"), row_names_(), row_texts_(),
+      row_is_nulls_()
+  {}
+  int operator()(const ObString &line)
+  {
+    int ret = OB_SUCCESS;
+    scratch_.reset();
+    row_names_.reuse();
+    row_texts_.reuse();
+    row_is_nulls_.reuse();
+    if (OB_FAIL(file_sql_json_line_to_fields(scratch_, line, row_names_, row_texts_,
+                                             row_is_nulls_))) {
+      LOG_WARN("failed to read the keys of the json row", K(ret), K(line));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < row_names_.count(); ++i) {
+      const ObString &key = row_names_.at(i);
+      if (file_sql_find_name(names_, key) < 0) {
+        ObString copied;
+        if (OB_FAIL(ob_write_string(stmt_alloc_, key, copied))) {
+          LOG_WARN("failed to copy the json key", K(ret), K(key));
+        } else if (OB_FAIL(names_.push_back(copied))) {
+          LOG_WARN("failed to record the json key", K(ret), K(copied));
+        }
+      }
+    }
+    return ret;
+  }
+private:
+  ObIAllocator &stmt_alloc_;
+  ObIArray<ObString> &names_;
+  common::ObArenaAllocator scratch_;
+  ObSEArray<ObString, 16> row_names_;
+  ObSEArray<ObString, 16> row_texts_;
+  ObSEArray<bool, 16> row_is_nulls_;
+};
+
+// Second pass over a json file: one row of the matrix infer_csv_types reads, in the column order
+// the first pass recorded. A key the row does not carry is a NULL, exactly as a short csv row
+// leaves the fields past its end, and every value arrives as the text a csv cell would have held,
+// so the type ladder stays the one the csv probe uses.
+class FileSqlJsonValueHandler
+{
+public:
+  FileSqlJsonValueHandler(const ObDMLResolver &resolver, const ObIArray<ObString> &names,
+                          const int64_t col_cnt,
+                          ObIArray<ObDMLResolver::FileSqlColumnSample> &samples)
+    : resolver_(resolver), names_(names), col_cnt_(col_cnt), samples_(samples),
+      scratch_("FileSqlJson"), row_names_(), row_texts_(), row_is_nulls_(), field_cnts_(),
+      values_(), is_nulls_()
+  {}
+  int operator()(const ObString &line)
+  {
+    int ret = OB_SUCCESS;
+    scratch_.reset();
+    row_names_.reuse();
+    row_texts_.reuse();
+    row_is_nulls_.reuse();
+    field_cnts_.reuse();
+    values_.reuse();
+    is_nulls_.reuse();
+    if (OB_FAIL(file_sql_json_line_to_fields(scratch_, line, row_names_, row_texts_,
+                                             row_is_nulls_))) {
+      LOG_WARN("failed to read the values of the json row", K(ret), K(line));
+    }
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt_; ++c) {
+      const int64_t hit = file_sql_find_name(row_names_, names_.at(c));
+      const ObString text = hit < 0 ? ObString() : row_texts_.at(hit);
+      const bool is_null = hit < 0 ? true : row_is_nulls_.at(hit);
+      if (OB_FAIL(values_.push_back(text))) {
+        LOG_WARN("failed to record the column value", K(ret), K(c), K(names_.at(c)));
+      } else if (OB_FAIL(is_nulls_.push_back(is_null))) {
+        LOG_WARN("failed to record the column null flag", K(ret), K(c), K(names_.at(c)));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(field_cnts_.push_back(col_cnt_))) {
+      LOG_WARN("failed to record the row width", K(ret), K(col_cnt_));
+    } else if (OB_FAIL(resolver_.infer_csv_types(col_cnt_, false, field_cnts_, values_, is_nulls_,
+                                                 samples_))) {
+      LOG_WARN("failed to fold the json row into the column types", K(ret), K(line));
+    }
+    return ret;
+  }
+private:
+  const ObDMLResolver &resolver_;
+  const ObIArray<ObString> &names_;
+  const int64_t col_cnt_;
+  ObIArray<ObDMLResolver::FileSqlColumnSample> &samples_;
+  common::ObArenaAllocator scratch_;
+  ObSEArray<ObString, 16> row_names_;
+  ObSEArray<ObString, 16> row_texts_;
+  ObSEArray<bool, 16> row_is_nulls_;
+  ObSEArray<int64_t, 1> field_cnts_;
+  ObSEArray<ObString, 16> values_;
+  ObSEArray<bool, 16> is_nulls_;
+};
+
+// Probes a newline delimited json file. The columns are the union of the keys of the sampled rows
+// and their types come from the same ladder a csv column runs through, so a jsonl file with one key
+// per line costs two reads of the file and no more memory than one row.
+int ObDMLResolver::scan_prefix_json_rows(const ObString &real_path, const ObFileTableDef &file_def,
+                                         ObIAllocator &alloc, int64_t &col_cnt,
+                                         ObIArray<FileSqlColumnSample> &samples,
+                                         ObIArray<ObString> &row_names) const
+{
+  int ret = OB_SUCCESS;
+  int64_t name_rows = 0;
+  int64_t value_rows = 0;
+  col_cnt = 0;
+  samples.reset();
+  row_names.reset();
+  FileSqlJsonNameHandler name_handler(alloc, row_names);
+  if (OB_FAIL(file_sql_scan_json_rows(*this, real_path, FILE_SQL_PROBE_CHUNK_SIZE,
+                                      file_def.sample_row_limit_, alloc, name_handler,
+                                      name_rows))) {
+    LOG_WARN("failed to probe the keys of the json file", K(ret), K(real_path));
+  } else if (name_rows <= 0 || row_names.count() <= 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a file without any row");
+    LOG_WARN("no json row found for the type probe", K(ret), K(real_path));
+  } else {
+    col_cnt = row_names.count();
+    FileSqlJsonValueHandler value_handler(*this, row_names, col_cnt, samples);
+    if (OB_FAIL(samples.prepare_allocate(col_cnt))) {
+      LOG_WARN("failed to prepare samples", K(ret), K(col_cnt));
+    } else if (OB_FAIL(file_sql_scan_json_rows(*this, real_path, FILE_SQL_PROBE_CHUNK_SIZE,
+                                               file_def.sample_row_limit_, alloc, value_handler,
+                                               value_rows))) {
+      LOG_WARN("failed to probe the values of the json file", K(ret), K(real_path));
+    } else if (value_rows <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("json file changed between the two probe passes", K(ret), K(real_path),
+               K(name_rows));
+    }
+  }
+  return ret;
+}
+
+// Packs the names of a jsonl probe into one '\0' separated blob: ObFileTableDef is copied by
+// assignment into the table item and never destructed, so it may own no container of its own.
+static int file_sql_pack_names(ObIAllocator &alloc, const ObIArray<ObString> &names,
+                               ObString &packed)
+{
+  int ret = OB_SUCCESS;
+  int64_t total = 0;
+  packed.reset();
+  for (int64_t i = 0; i < names.count(); ++i) {
+    total += names.at(i).length() + 1;
+  }
+  if (total <= 0) {
+    // nothing to name
+  } else if (total > INT32_MAX) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "too many columns in one json file");
+    LOG_WARN("the json column names are too wide to pack", K(ret), K(total));
+  } else {
+    char *buf = NULL;
+    int64_t pos = 0;
+    if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(static_cast<int64_t>(total))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc the packed column names", K(ret), K(total));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+      const ObString &name = names.at(i);
+      MEMCPY(buf + pos, name.ptr(), name.length());
+      pos += name.length();
+      buf[pos] = '\0';
+      ++pos;
+    }
+    if (OB_SUCC(ret)) {
+      packed.assign_ptr(buf, static_cast<int32_t>(total));
+    }
+  }
+  return ret;
+}
+
+// Folds one chunk of sampled values into the running type of every column. The ladder keeps the
+// narrowest type that still fits every value seen so far, so a single non fitting value widens the
+// column for good and NULLs, whatever their spelling, never narrow it.
+int ObDMLResolver::infer_csv_types(const int64_t col_cnt,
+                                   const bool skip_first_row,
+                                   const ObIArray<int64_t> &field_cnts,
+                                   const ObIArray<ObString> &values,
+                                   const ObIArray<bool> &is_nulls,
+                                   ObIArray<FileSqlColumnSample> &samples) const
+{
+  int ret = OB_SUCCESS;
+  if (col_cnt <= 0 || samples.count() != col_cnt
+      || values.count() != field_cnts.count() * col_cnt
+      || is_nulls.count() != values.count()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid type infer arguments", K(ret), K(col_cnt), "samples", samples.count(),
+             "rows", field_cnts.count(), "values", values.count(), "nulls", is_nulls.count());
+  }
+  for (int64_t r = 0; OB_SUCC(ret) && r < field_cnts.count(); ++r) {
+    if (0 == r && skip_first_row) {
+      // the header row only names the columns, it says nothing about their type
+    } else {
+      const int64_t base = r * col_cnt;
+      const int64_t real = field_cnts.at(r);
+      for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+        FileSqlColumnSample &sample = samples.at(c);
+        const int64_t idx = base + c;
+        if (c >= real || is_nulls.at(idx)) {
+          sample.seen_null_ = true;
+        } else {
+          const ObString value = values.at(idx);
+          int32_t level = FILE_SQL_TYPE_LEVEL_VARCHAR;
+          if (file_sql_is_bool_shape(value)) {
+            level = FILE_SQL_TYPE_LEVEL_BOOLEAN;
+          } else if (file_sql_is_int_shape(value)) {
+            level = FILE_SQL_TYPE_LEVEL_BIGINT;
+          } else if (file_sql_is_double_shape(value)) {
+            level = FILE_SQL_TYPE_LEVEL_DOUBLE;
+          } else if (file_sql_is_date_shape(value)) {
+            int32_t date_value = 0;
+            if (OB_SUCCESS == ObTimeConverter::str_to_date(value, date_value)) {
+              level = FILE_SQL_TYPE_LEVEL_DATE;
+            }
+          } else if (file_sql_is_datetime_shape(value)) {
+            // ObTimeConverter only understands the space separated form, while the shape check
+            // above also accepts the ISO 'T' that csv writers produce.
+            char normalized[32] = { '\0' };
+            int64_t ts_value = 0;
+            ObString norm;
+            if (value.length() >= static_cast<int32_t>(sizeof(normalized))) {
+              // too long to be a datetime the converter accepts, stay on the wide rung
+            } else {
+              MEMCPY(normalized, value.ptr(), value.length());
+              if ('T' == normalized[10] || 't' == normalized[10]) {
+                normalized[10] = ' ';
+              }
+              norm.assign_ptr(normalized, value.length());
+              const ObTimeConvertCtx ctx(session_info_->get_timezone_info(), false);
+              if (OB_SUCCESS == ObTimeConverter::str_to_datetime(norm, ctx, ts_value)) {
+                level = FILE_SQL_TYPE_LEVEL_DATETIME;
+              }
+            }
+          }
+          if (level > sample.type_level_) {
+            sample.type_level_ = level;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// DuckDB spells the second column of a repeated header name id__2, which is what the file_sql
+// tests expect, so the count of the names already taken before this one drives the suffix.
+int ObDMLResolver::make_unique_col_name(const ObString &raw_name, ObIAllocator &alloc,
+                                        ObIArray<ObString> &taken_names,
+                                        ObString &final_name) const
+{
+  int ret = OB_SUCCESS;
+  int64_t dup = 0;
+  final_name.reset();
+  for (int64_t i = 0; i < taken_names.count(); ++i) {
+    if (ObCharset::case_insensitive_equal(taken_names.at(i), raw_name)) {
+      ++dup;
+    }
+  }
+  if (0 == dup) {
+    if (OB_FAIL(ob_write_string(alloc, raw_name, final_name))) {
+      LOG_WARN("failed to copy the column name", K(ret), K(raw_name));
+    }
+  } else {
+    char buf[OB_MAX_COLUMN_NAME_BUF_LENGTH + 1] = { '\0' };
+    int64_t pos = 0;
+    if (OB_FAIL(databuff_printf(buf, sizeof(buf), pos, "%.*s__%ld", raw_name.length(),
+                                raw_name.ptr(), dup + 1))) {
+      LOG_WARN("failed to build the duplicated column name", K(ret), K(raw_name), K(dup));
+    } else if (OB_FAIL(ob_write_string(alloc, ObString(static_cast<int32_t>(pos), buf),
+                                       final_name))) {
+      LOG_WARN("failed to copy the column name", K(ret), K(raw_name), K(dup));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(taken_names.push_back(final_name))) {
+    LOG_WARN("failed to record the column name", K(ret), K(final_name));
+  }
+  return ret;
+}
+
+// A glob lists files instead of reading one, so there is nothing to probe: the schema of the scan
+// is the single file column the matched names are listed into. Like the probes of read_csv and
+// read_json this is called from the else if chain of resolve_file_table_item, where a successful
+// call has to leave the chain running so that the table item still gets created.
+static int file_sql_fill_glob_columns(common::ObIAllocator &alloc,
+                                      common::ObIArray<ObDMLResolver::FileSqlColumnSample> &samples,
+                                      common::ObIArray<common::ObString> &names, int64_t &col_cnt)
+{
+  int ret = OB_SUCCESS;
+  ObDMLResolver::FileSqlColumnSample sample;
+  ObString name;
+  sample.type_level_ = FILE_SQL_TYPE_LEVEL_VARCHAR;
+  col_cnt = 1;
+  if (OB_FAIL(ob_write_string(alloc, ObString::make_string("file"), name))) {
+    LOG_WARN("failed to copy the glob column name", K(ret));
+  } else if (OB_FAIL(samples.push_back(sample))) {
+    LOG_WARN("failed to add the glob column sample", K(ret));
+  } else if (OB_FAIL(names.push_back(name))) {
+    LOG_WARN("failed to add the glob column name", K(ret));
+  }
+  return ret;
+}
+
+// Resolves read_csv/read_json/read_parquet/glob in table position. read_csv and read_json probe the
+// file and become a function table whose columns are the inferred ones, glob becomes one that has
+// only the file column the pattern is listed into, and read_parquet still reports the scan as not
+// supported.
+int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *path_node = NULL;
+  ObString file_path;
+  bool enabled = false;
+  ObFileTableDef file_def;
+  ObString real_path;
+  table_item = NULL;
+  if (T_FILE_TABLE_EXPRESSION != parse_tree.type_ || 3 != parse_tree.num_child_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table type not support ot param num mismatch", K(parse_tree.type_), K(parse_tree.num_child_));
+  } else if (OB_FAIL(check_file_sql_enabled(enabled))) {
+    LOG_WARN("failed to check enable_file_sql", K(ret));
+  } else if (!enabled) {
+    // nothing below reads the filesystem
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function when enable_file_sql is off");
+    LOG_WARN("file table function is disabled by enable_file_sql", K(ret), K(parse_tree.value_));
+  } else if (OB_ISNULL(path_node = parse_tree.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null file path node", K(ret));
+  } else if (T_VARCHAR != path_node->type_ && T_CHAR != path_node->type_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "non-constant file path");
+    LOG_WARN("only string literal file paths are supported", K(ret), K(path_node->type_));
+  } else if (OB_FALSE_IT(file_path.assign_ptr(path_node->str_value_,
+                                             static_cast<int32_t>(path_node->str_len_)))) {
+  } else if (file_path.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("empty file path", K(ret), K(parse_tree.value_));
+  } else if (OB_FAIL(check_file_table_params(parse_tree.value_, parse_tree.children_[1],
+                                             &file_def))) {
+    LOG_WARN("failed to check file table params", K(ret), K(parse_tree.value_));
+  } else if (OB_FAIL(check_file_table_path(file_path, real_path))) {
+    LOG_WARN("failed to check file table path", K(ret), K(file_path));
+  } else if (FILE_SQL_READ_CSV != parse_tree.value_ && FILE_SQL_READ_JSON != parse_tree.value_
+             && FILE_SQL_GLOB != parse_tree.value_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading files as tables");
+    LOG_WARN("file table scan is not implemented yet", K(ret), K(file_path), K(parse_tree.value_));
+  } else {
+    ObDMLStmt *stmt = get_stmt();
+    TableItem *item = NULL;
+    ObConstRawExpr *path_expr = NULL;
+    ObSEArray<FileSqlColumnSample, 16> samples;
+    ObSEArray<ObString, 16> probe_names;
+    ObSEArray<ObString, 16> taken_names;
+    int64_t col_cnt = 0;
+    if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(params_.expr_factory_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("resolver is not initialized", K(ret));
+    } else if (FILE_SQL_GLOB == parse_tree.value_
+               && OB_FAIL(file_sql_fill_glob_columns(*allocator_, samples, probe_names, col_cnt))) {
+      LOG_WARN("failed to fill the glob column", K(ret));
+    } else if (FILE_SQL_READ_JSON == parse_tree.value_
+               && OB_FAIL(scan_prefix_json_rows(real_path, file_def, *allocator_, col_cnt,
+                                                samples, probe_names))) {
+      LOG_WARN("failed to probe the jsonl file", K(ret), K(real_path));
+    } else if (FILE_SQL_READ_JSON != parse_tree.value_
+               // A glob filled its one column above and has no file to probe, and its pattern is
+               // not a name that can be opened, so the csv probe must not run for it.
+               && FILE_SQL_GLOB != parse_tree.value_
+               && OB_FAIL(scan_prefix_rows(real_path, file_def, *allocator_, col_cnt, samples,
+                                           probe_names))) {
+      LOG_WARN("failed to probe the csv file", K(ret), K(real_path));
+    } else if (col_cnt <= 0 || samples.count() != col_cnt) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected csv probe result", K(ret), K(col_cnt), "samples", samples.count());
+    } else if (FILE_SQL_READ_JSON == parse_tree.value_
+               && OB_FAIL(file_sql_pack_names(*allocator_, probe_names, file_def.column_names_))) {
+      LOG_WARN("failed to pack the json column names", K(ret), K(col_cnt));
+    } else if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to create table item", K(ret));
+    } else {
+      char *def_buf = static_cast<char *>(allocator_->alloc(sizeof(ObFileTableDef)));
+      const ParseNode *alias_node = parse_tree.children_[2];
+      ObString alias_name;
+      if (OB_ISNULL(def_buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to alloc file table def", K(ret));
+      } else if (NULL != alias_node && T_NULL != alias_node->type_
+                 && NULL != alias_node->str_value_) {
+        alias_name.assign_ptr(alias_node->str_value_,
+                              static_cast<int32_t>(alias_node->str_len_));
+      } else if (OB_FAIL(stmt->generate_func_table_name(*allocator_, alias_name))) {
+        LOG_WARN("failed to generate the table name", K(ret));
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        ObObj path_obj;
+        path_obj.set_varchar(real_path);
+        // ObObj::set_varchar sets only CS_LEVEL_IMPLICIT and leaves cs_type_ at CS_TYPE_INVALID,
+        // which the string datum funcs selected for this const expr refuse to accept.
+        path_obj.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+        // The scan is planned as a function table, so the file itself travels to the executor as
+        // the value expression of that table. As a const it reuses everything the function table
+        // path machinery already does (path generation, the value expr, CG) for free.
+        if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_VARCHAR, path_expr))) {
+          LOG_WARN("failed to create path expr", K(ret));
+        } else if (OB_ISNULL(path_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          path_expr->set_value(path_obj);
+          sql::ObRawExprResType path_type;
+          path_type.set_meta(path_obj.get_meta());
+          path_type.set_accuracy(ObAccuracy::MAX_ACCURACY[ObVarcharType]);
+          path_expr->set_result_type(path_type);
+          item->type_ = TableItem::FUNCTION_TABLE;
+          item->table_id_ = generate_table_id();
+          item->table_name_ = alias_name;
+          item->alias_name_ = alias_name;
+          item->function_table_expr_ = path_expr;
+          item->file_table_def_ = new (def_buf) ObFileTableDef();
+          *item->file_table_def_ = file_def;
+          item->file_table_def_->inferred_column_count_ = col_cnt;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      LOG_WARN("failed to add table item", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
+      ColumnItem *col_item = NULL;
+      ObString raw_name = i < probe_names.count() ? probe_names.at(i) : ObString();
+      ObString col_name;
+      ObObjMeta meta;
+      ObAccuracy accuracy;
+      if (raw_name.empty()) {
+        char gen[32] = { '\0' };
+        int64_t pos = 0;
+        if (OB_FAIL(databuff_printf(gen, sizeof(gen), pos, "column%02ld", i))) {
+          LOG_WARN("failed to build the column name", K(ret), K(i));
+        } else if (OB_FAIL(ob_write_string(*allocator_, ObString(static_cast<int32_t>(pos), gen),
+                                           raw_name))) {
+          LOG_WARN("failed to copy the column name", K(ret), K(i));
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_UNLIKELY(samples.at(i).type_level_ < 0
+                             || samples.at(i).type_level_ >= FILE_SQL_TYPE_LEVEL_COUNT)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected inferred type level", K(ret), K(i), K(samples.at(i)));
+      } else if (OB_FAIL(make_unique_col_name(raw_name, *allocator_, taken_names, col_name))) {
+        LOG_WARN("failed to make the column name unique", K(ret), K(raw_name));
+      } else {
+        const ObObjType type = FILE_SQL_LEVEL_TYPES[samples.at(i).type_level_];
+        meta.set_type(type);
+        if (ObVarcharType == type) {
+          // set_type leaves both collation legs alone for the string types, and deducing the type
+          // of a string column ref refuses either leg when it is still the invalid default.
+          meta.set_collation_level(CS_LEVEL_IMPLICIT);
+          meta.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+        }
+        // A file declares no accuracy, so a column gets what the same type has in a table created
+        // without one: MAX_ACCURACY is the widest legal declaration instead, which reads as
+        // double(255,30) and datetime(6) and makes 98.5 print with 30 decimals and a whole second
+        // with .000000.
+        accuracy = ObAccuracy::MAX_ACCURACY[type];
+        if (ObDoubleType == type) {
+          accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[type];
+        } else if (ObDateTimeType == type) {
+          accuracy.set_scale(0);
+        }
+        if (OB_FAIL(resolve_function_table_column_item(*item, meta, accuracy, col_name,
+                                                       OB_APP_MIN_COLUMN_ID + i, col_item))) {
+          LOG_WARN("failed to add the inferred column", K(ret), K(i), K(col_name));
+        } else if (OB_NOT_NULL(col_item)) {
+          // the position inside the file, which is also the index into the spec column array
+          col_item->col_idx_ = static_cast<uint32_t>(i);
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // DESCRIBE has to report which columns the file leaves empty, and a null is the one thing a
+      // sample says that the column items do not keep, so the probe results go along in the def.
+      char *null_buf = static_cast<char *>(allocator_->alloc(col_cnt));
+      if (OB_ISNULL(null_buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to alloc the packed column nulls", K(ret), K(col_cnt));
+      } else {
+        for (int64_t i = 0; i < col_cnt; ++i) {
+          null_buf[i] = samples.at(i).seen_null_ ? 1 : 0;
+        }
+        item->file_table_def_->column_nulls_.assign_ptr(null_buf, static_cast<int32_t>(col_cnt));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      table_item = item;
+    } else if (OB_NOT_NULL(item)) {
+      table_item = NULL;
+    }
   }
   return ret;
 }
@@ -6777,6 +8008,15 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
     // do nothing ...
   } else if (NULL != (col_item = stmt->get_column_item(table_item.table_id_, column_name))) {
     //exist, ignore resolve...
+  } else if (table_item.is_file_table()) {
+    // Every column of a file table exists in the statement or not at all: they were all registered
+    // when the table item was resolved, and the namespace check in the checker reads the same
+    // list. The generic path below asks the table function namespace, which only handles UDT
+    // results and would end in an internal error for a name the file does not have.
+    ret = OB_ERR_BAD_FIELD_ERROR;
+    ObString scope_name = ObString::make_string(get_scope_name(current_scope_));
+    LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, column_name.length(), column_name.ptr(),
+                   scope_name.length(), scope_name.ptr());
   } else {
     ObSEArray<ColumnItem, 16> col_items;
     OZ (ObResolverUtils::check_function_table_column_exist(table_item,
@@ -7475,7 +8715,21 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_item.function_table_expr_));
   if (OB_SUCC(ret)) {
-    if (table_item.function_table_expr_->get_result_type().is_ext()) {
+    if (table_item.is_file_table()) {
+      // A file table registered one column item per inferred column while it was resolved, so a
+      // star only has to collect them back instead of deriving the single COLUMN_VALUE that a
+      // table function produces.
+      ObDMLStmt *stmt = get_stmt();
+      CK (OB_NOT_NULL(stmt));
+      for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {
+        ColumnItem *column_item = stmt->get_column_item(i);
+        CK (OB_NOT_NULL(column_item));
+        if (OB_SUCC(ret) && column_item->table_id_ == table_item.table_id_
+            && OB_FAIL(col_items.push_back(*column_item))) {
+          LOG_WARN("failed to collect the file table column", K(ret), K(i));
+        }
+      }
+    } else if (table_item.function_table_expr_->get_result_type().is_ext()) {
       ret = resolve_function_table_column_item_udf(table_item, col_items);
     } else {
       ret = resolve_function_table_column_item_sys_func(table_item, col_items);

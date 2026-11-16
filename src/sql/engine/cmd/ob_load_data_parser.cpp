@@ -18,6 +18,8 @@
 
 #include "ob_load_data_parser.h"
 #include "common/ob_hex_utils_base.h"
+#include "common/json_type/ob_json_parse.h"
+#include "common/json_type/ob_json_tree.h"
 #include "src/sql/engine/ob_exec_context.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 
@@ -679,6 +681,104 @@ OB_DEF_SERIALIZE_SIZE(ObExternalFileFormat::StringData)
   int64_t len = 0;
   LST_DO_CODE(OB_UNIS_ADD_LEN, str_);
   return len;
+}
+
+// Shared by file_sql resolver and executor, see the declaration for the contract. A number and a
+// boolean are printed back into the text a csv cell would have carried, which keeps the type
+// inference and the value conversion of the file table path single sourced: the text the probe
+// inferred from is the text the scan converts.
+int file_sql_json_line_to_fields(ObIAllocator &alloc, const ObString &line,
+                                 ObIArray<ObString> &names, ObIArray<ObString> &texts,
+                                 ObIArray<bool> &is_nulls)
+{
+  int ret = OB_SUCCESS;
+  ObJsonNode *tree = NULL;
+  if (OB_FAIL(ObJsonParser::get_tree(&alloc, line, tree))) {
+    LOG_WARN("failed to parse the json line", K(ret), K(line));
+  } else if (OB_ISNULL(tree)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null json tree", K(ret), K(line));
+  } else if (ObJsonNodeType::J_OBJECT != tree->json_type()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "a json line that is not an object");
+    LOG_WARN("the json line is not one object", K(ret), K(line),
+             "json_type", static_cast<int64_t>(tree->json_type()));
+  } else {
+    ObJsonObject *object = static_cast<ObJsonObject *>(tree);
+    for (uint64_t i = 0; OB_SUCC(ret) && i < object->element_count(); ++i) {
+      ObString key;
+      ObJsonNode *value = NULL;
+      ObString text;
+      bool is_null = false;
+      if (OB_FAIL(object->get_value_by_idx(i, key, value))) {
+        LOG_WARN("failed to read the json member", K(ret), K(i));
+      } else if (OB_ISNULL(value)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null json member", K(ret), K(i), K(key));
+      } else {
+        switch (value->json_type()) {
+          case ObJsonNodeType::J_NULL: {
+            is_null = true;
+            break;
+          }
+          case ObJsonNodeType::J_BOOLEAN: {
+            text = value->get_boolean() ? ObString::make_string("true")
+                                        : ObString::make_string("false");
+            break;
+          }
+          case ObJsonNodeType::J_INT:
+          case ObJsonNodeType::J_UINT:
+          case ObJsonNodeType::J_DOUBLE: {
+            char buf[64] = { '\0' };
+            int64_t pos = 0;
+            if (ObJsonNodeType::J_INT == value->json_type()) {
+              if (OB_FAIL(databuff_printf(buf, sizeof(buf), pos, "%ld", value->get_int()))) {
+                LOG_WARN("failed to print the json int", K(ret), K(key));
+              }
+            } else if (ObJsonNodeType::J_UINT == value->json_type()) {
+              if (OB_FAIL(databuff_printf(buf, sizeof(buf), pos, "%llu",
+                                          static_cast<unsigned long long>(value->get_uint())))) {
+                LOG_WARN("failed to print the json uint", K(ret), K(key));
+              }
+            } else if (OB_FAIL(databuff_printf(buf, sizeof(buf), pos, "%.15g",
+                                               value->get_double()))) {
+              LOG_WARN("failed to print the json double", K(ret), K(key));
+            }
+            if (OB_FAIL(ret)) {
+            } else if (OB_FAIL(ob_write_string(alloc, ObString(static_cast<int32_t>(pos), buf),
+                                               text))) {
+              LOG_WARN("failed to copy the printed json number", K(ret), K(key));
+            }
+            break;
+          }
+          case ObJsonNodeType::J_STRING: {
+            // already unescaped by the parser, so \" and \n inside a value need no second pass
+            text = static_cast<ObJsonString *>(value)->value();
+            break;
+          }
+          default: {
+            // an object or an array value has nowhere to go inside a scalar file table column
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a nested json value");
+            LOG_WARN("unsupported json value", K(ret), K(key),
+                     "json_type", static_cast<int64_t>(value->json_type()));
+            break;
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(names.push_back(key))) {
+        LOG_WARN("failed to add the json member name", K(ret), K(key));
+      } else if (OB_FAIL(texts.push_back(text))) {
+        LOG_WARN("failed to add the json member value", K(ret), K(key));
+      } else if (OB_FAIL(is_nulls.push_back(is_null))) {
+        LOG_WARN("failed to add the json member null flag", K(ret), K(key));
+      }
+    }
+    // the member array of the object is not arena memory, so its destructor has to run
+    tree->~ObJsonNode();
+  }
+  return ret;
 }
 
 }

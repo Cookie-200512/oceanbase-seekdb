@@ -5509,6 +5509,10 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(generate_rt_expr(*value_raw_expr, value_expr))) {
   } else {
+    TableItem *file_item = op.get_stmt()->get_table_item_by_id(op.get_table_id());
+    if (OB_NOT_NULL(file_item) && !file_item->is_file_table()) {
+      file_item = nullptr;
+    }
     spec.has_correlated_expr_ = value_raw_expr->has_flag(CNT_DYNAMIC_PARAM);
     spec.value_expr_ = value_expr;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
@@ -5520,12 +5524,62 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       const ColumnItem *col_item = op.get_stmt()->get_column_item(i);
       CK (OB_NOT_NULL(col_item));
       CK (OB_NOT_NULL(col_item->expr_));
+      // A file table materialises the whole inferred row even when the query reads one column of
+      // it: its column items are ordered by the position in the file, so the scanner can write
+      // column_exprs_.at(field index) without a second index in the spec.
       if (OB_SUCC(ret)
           && col_item->table_id_ == op.get_table_id()
-          && col_item->expr_->is_explicited_reference()) {
+          && (OB_NOT_NULL(file_item) || col_item->expr_->is_explicited_reference())) {
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
         OZ (spec.column_exprs_.push_back(rt_expr));
+      }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(file_item)) {
+      const ObFileTableDef &file_def = *file_item->get_file_table_def();
+      // the kind of read_* the resolver resolved, spelled the same way as in the resolver and in
+      // the executor
+      const int64_t FILE_SQL_CG_FORMAT_JSONL = 1;
+      if (spec.column_exprs_.count() != file_def.inferred_column_count_) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected file table column set", K(ret), K(file_def),
+                 "column_cnt", spec.column_exprs_.count());
+      } else {
+        spec.file_params_.file_format_ = file_def.file_format_;
+        spec.file_params_.parse_header_ = file_def.parse_header_;
+        spec.file_params_.skip_header_lines_ = file_def.skip_header_lines_;
+        spec.file_params_.field_term_ = file_def.field_term_;
+        spec.file_params_.line_term_ = file_def.line_term_;
+        spec.file_params_.enclosed_char_ = file_def.enclosed_char_;
+        spec.file_params_.escaped_char_ = file_def.escaped_char_;
+        spec.file_params_.sample_row_limit_ = file_def.sample_row_limit_;
+        spec.file_params_.inferred_column_count_ = file_def.inferred_column_count_;
+        // A jsonl scan looks every value of a row up by its key, so the names the resolver probed
+        // have to outlive the statement. The def carries them as one '\0' separated blob because it
+        // is copied by assignment and owns no container, and the plan needs its own copies of the
+        // bytes, which the resolver allocator does not keep alive for a cached plan.
+        const char *name_ptr = file_def.column_names_.ptr();
+        const char *name_end = name_ptr + file_def.column_names_.length();
+        int64_t name_cnt = 0;
+        for (const char *p = name_ptr; p < name_end; p = strchr(p, '\0') + 1) {
+          ++name_cnt;
+        }
+        if (OB_FAIL(spec.column_names_.init(name_cnt))) {
+          LOG_WARN("failed to init the file table column names", K(ret), K(name_cnt));
+        } else if (FILE_SQL_CG_FORMAT_JSONL == file_def.file_format_
+                   && name_cnt != file_def.inferred_column_count_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected jsonl column name count", K(ret), K(name_cnt), K(file_def));
+        }
+        for (const char *p = name_ptr; OB_SUCC(ret) && p < name_end; p = strchr(p, '\0') + 1) {
+          const ObString raw_name(static_cast<int32_t>(strlen(p)), p);
+          ObString copied;
+          if (OB_FAIL(ob_write_string(alloc, raw_name, copied))) {
+            LOG_WARN("failed to copy the file table column name", K(ret), K(raw_name));
+          } else if (OB_FAIL(spec.column_names_.push_back(copied))) {
+            LOG_WARN("failed to add the file table column name", K(ret), K(copied));
+          }
+        }
       }
     }
   }

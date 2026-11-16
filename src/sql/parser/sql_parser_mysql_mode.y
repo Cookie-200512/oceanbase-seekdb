@@ -289,7 +289,7 @@ END_P SET_VAR DELIMITER
         FOUND FORK FREEZE FREQUENCY FUNCTION FOLLOWING FLASHBACK FULL FRAGMENTATION FROZEN FILE_ID FILTER
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION
 
-        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
+        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOB GLOBAL GRANTS GROUP_CONCAT GROUPING
         GLOBAL_ALIAS
 
         HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
@@ -337,6 +337,7 @@ END_P SET_VAR DELIMITER
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
+        READ_CSV READ_JSON READ_PARQUET
 
         SAMPLE SAVEPOINT SCALARS SCHEMA_NAME SCN SCOPE SCORE SECOND SECURITY SEED
         SEMISTRUCT_ENCODING_TYPE SERIAL SERIALIZABLE SESSION SESSION_USER SET_TP SHARE SHARED SHUTDOWN SIGNED
@@ -514,6 +515,7 @@ END_P SET_VAR DELIMITER
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
+%type <node> file_table_expr opt_file_table_params file_table_param_list file_table_param file_table_param_value
 %start sql_stmt
 %%
 ////////////////////////////////////////////////////////////////
@@ -10848,6 +10850,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 ;
 
 tbl_name:
@@ -17479,6 +17485,123 @@ literal
 }
 ;
 
+/*===========================================================
+*
+*  FILE TABLE: read_csv / read_json / read_parquet / glob
+*============================================================*/
+
+file_table_expr:
+READ_CSV '(' STRING_VALUE opt_file_table_params ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $6);
+  $$->value_ = 0; //read_csv
+}
+| READ_CSV '(' STRING_VALUE opt_file_table_params ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $7);
+  $$->value_ = 0; //read_csv
+}
+| READ_CSV '(' STRING_VALUE opt_file_table_params ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, NULL);
+  $$->value_ = 0; //read_csv
+}
+| READ_JSON '(' STRING_VALUE opt_file_table_params ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $6);
+  $$->value_ = 1; //read_json
+}
+| READ_JSON '(' STRING_VALUE opt_file_table_params ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $7);
+  $$->value_ = 1; //read_json
+}
+| READ_JSON '(' STRING_VALUE opt_file_table_params ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, NULL);
+  $$->value_ = 1; //read_json
+}
+| READ_PARQUET '(' STRING_VALUE opt_file_table_params ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $6);
+  $$->value_ = 2; //read_parquet
+}
+| READ_PARQUET '(' STRING_VALUE opt_file_table_params ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $7);
+  $$->value_ = 2; //read_parquet
+}
+| READ_PARQUET '(' STRING_VALUE opt_file_table_params ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, NULL);
+  $$->value_ = 2; //read_parquet
+}
+| GLOB '(' STRING_VALUE opt_file_table_params ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $6);
+  $$->value_ = 3; //glob
+}
+| GLOB '(' STRING_VALUE opt_file_table_params ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, $7);
+  $$->value_ = 3; //glob
+}
+| GLOB '(' STRING_VALUE opt_file_table_params ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $3, $4, NULL);
+  $$->value_ = 3; //glob
+}
+;
+
+opt_file_table_params:
+/*EMPTY*/
+{
+  $$ = NULL;
+}
+| ',' file_table_param_list
+{
+  merge_nodes($$, result, T_EXPR_LIST, $2);
+}
+;
+
+file_table_param_list:
+file_table_param
+{
+  $$ = $1;
+}
+| file_table_param_list ',' file_table_param
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_table_param:
+relation_name COMP_EQ file_table_param_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_table_param_value:
+STRING_VALUE
+{
+  $$ = $1;
+}
+| BOOL_VALUE
+{
+  $$ = $1;
+}
+| INTNUM
+{
+  $$ = $1;
+}
+| '-' INTNUM
+{
+  $2->value_ = -$2->value_;
+  $$ = $2;
+}
+;
+
 unreserved_keyword:
 unreserved_keyword_for_role_name { $$=$1;}
 | unreserved_keyword_ambiguous_roles { $$=$1;}
@@ -18181,6 +18304,10 @@ ACCOUNT
 |       INCONSISTENT 
 |       INDIVIDUAL
 |       HYBRID_SEARCH
+|       READ_CSV
+|       READ_JSON
+|       READ_PARQUET
+|       GLOB
 ;
 
 unreserved_keyword_special:
