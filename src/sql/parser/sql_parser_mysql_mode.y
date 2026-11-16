@@ -516,6 +516,7 @@ END_P SET_VAR DELIMITER
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
 %type <node> file_table_expr opt_file_table_params file_table_param_list file_table_param file_table_param_value
+%type <node> copy_stmt copy_options copy_opt_list copy_opt
 %start sql_stmt
 %%
 ////////////////////////////////////////////////////////////////
@@ -558,6 +559,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8469,6 +8471,65 @@ select_no_parens into_clause
       $$->children_[PARSE_SELECT_INTO_EXTRA] = $2;
     }
   }
+}
+;
+
+// COPY is the file_sql export statement. Its source is a parenthesized query and its target is a
+// file that must not exist yet, so the option list is the bare `(format csv, header, nullstr 'X')`
+// style the file_sql suite writes, not the `k => v` form the file table functions and external
+// files use. The into node is hung on the select exactly like an `into ...` clause is, which keeps
+// the whole select -> ObLogSelectInto -> ObSelectIntoSpec -> ObSelectIntoOp pipeline unchanged;
+// only into_type_ tells those layers that this one writes a copy target.
+copy_stmt:
+COPY select_with_parens TO STRING_VALUE copy_options
+{
+  $$ = $2;
+  if ($$->children_[PARSE_SELECT_INTO] != NULL
+      || $$->children_[PARSE_SELECT_INTO_EXTRA] != NULL) {
+    yyerror(&@2, result, "");
+    YYERROR;
+  } else {
+    malloc_non_terminal_node($$->children_[PARSE_SELECT_INTO_EXTRA],
+                             result->malloc_pool_, T_COPY_TO_FILE, 2, $4, $5);
+  }
+}
+;
+
+copy_options:
+'(' copy_opt_list ')'
+{
+  merge_nodes($$, result, T_EXPR_LIST, $2);
+}
+| /*EMPTY*/
+{
+  $$ = NULL;
+}
+;
+
+copy_opt_list:
+copy_opt
+{
+  $$ = $1;
+}
+| copy_opt_list ',' copy_opt
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+// A bare option carries no value node; the resolver reads a NULL child as "just turned on".
+copy_opt:
+FORMAT relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_FORMAT, 1, $2);
+}
+| relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, NULL);
+}
+| relation_name STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
 }
 ;
 

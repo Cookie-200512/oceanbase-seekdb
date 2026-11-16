@@ -124,6 +124,8 @@ const int64_t FILE_SQL_TERM_BUF_SIZE = 4;
 // instead of reused from the resolver, whose file scope the Unity build shares with this one.
 const int64_t FILE_SQL_SPEC_FORMAT_CSV = 0;
 const int64_t FILE_SQL_SPEC_FORMAT_JSONL = 1;
+// The second entry of ObFileTableFuncKind, whose columns and values come from the file footer.
+const int64_t FILE_SQL_SPEC_FORMAT_PARQUET = 2;
 // The third entry of ObFileTableFuncKind, which is a directory pattern rather than a file to read.
 const int64_t FILE_SQL_SPEC_FORMAT_GLOB = 3;
 
@@ -500,7 +502,10 @@ int ObFunctionTableOp::open_file_reader()
   common::ObString real_path;
   char path_buf[FILE_SQL_PATH_BUF_SIZE + 1];
   int fd = -1;
-  if (FILE_SQL_SPEC_FORMAT_GLOB == MY_SPEC.file_params_.file_format_) {
+  if (FILE_SQL_SPEC_FORMAT_PARQUET == MY_SPEC.file_params_.file_format_) {
+    // the values of a column are read as one decoded block, not streamed line by line
+    ret = open_parquet_reader();
+  } else if (FILE_SQL_SPEC_FORMAT_GLOB == MY_SPEC.file_params_.file_format_) {
     // a pattern names no file to read, so the scan opens a listing instead
     ret = open_glob_reader();
   } else if (OB_UNLIKELY(col_cnt <= 0) || OB_ISNULL(MY_SPEC.value_expr_)) {
@@ -716,6 +721,11 @@ int ObFunctionTableOp::release_file_reader()
   // the pages of the json scratch are freed here rather than by a destructor, which the operator
   // arena never runs
   file_json_scratch_.reset();
+  // the decoded parquet column goes back the same way, or a rescan would keep the whole column of
+  // the previous scan alive next to the new one
+  if (OB_NOT_NULL(parquet_reader_)) {
+    parquet_reader_->close();
+  }
   return ret;
 }
 
@@ -724,7 +734,10 @@ int ObFunctionTableOp::inner_get_next_row_file()
   int ret = OB_SUCCESS;
   const int64_t col_cnt = MY_SPEC.file_params_.inferred_column_count_;
   clear_evaluated_flag();
-  if (FILE_SQL_SPEC_FORMAT_GLOB == MY_SPEC.file_params_.file_format_) {
+  if (FILE_SQL_SPEC_FORMAT_PARQUET == MY_SPEC.file_params_.file_format_) {
+    // the next row is the next decoded value of the column, not the next line of a file
+    ret = inner_get_next_row_parquet();
+  } else if (FILE_SQL_SPEC_FORMAT_GLOB == MY_SPEC.file_params_.file_format_) {
     // the next row is another matched name, not another line of a file
     ret = inner_get_next_row_glob();
   } else if (FILE_SQL_SPEC_FORMAT_JSONL == MY_SPEC.file_params_.file_format_) {
@@ -991,6 +1004,84 @@ int ObFunctionTableOp::inner_get_next_row_glob()
       ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
       if (OB_FAIL(datum.from_obj(obj, expr->obj_datum_map_))) {
         LOG_WARN("failed to write a glob path", K(ret), K(path));
+      } else {
+        expr->set_evaluated_projected(eval_ctx_);
+      }
+    }
+  }
+  return ret;
+}
+
+// The whole column of a parquet file is decoded when the scan opens, so the path is taken the same
+// way the csv scan takes it (the const value expression the resolver canonicalised) and then handed
+// to the reader, which keeps the file itself closed.
+int ObFunctionTableOp::open_parquet_reader()
+{
+  int ret = OB_SUCCESS;
+  ObDatum *path_datum = NULL;
+  common::ObString real_path;
+  char path_buf[FILE_SQL_PATH_BUF_SIZE + 1];
+  if (OB_ISNULL(MY_SPEC.value_expr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null parquet path expr", K(ret));
+  } else if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, path_datum))) {
+    LOG_WARN("failed to eval the parquet path", K(ret));
+  } else if (OB_ISNULL(path_datum) || path_datum->is_null()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file path");
+    LOG_WARN("unexpected null parquet path", K(ret), KP(path_datum));
+  } else if (FALSE_IT(real_path = path_datum->get_string())) {
+  } else if (OB_UNLIKELY(real_path.empty() || real_path.length() > FILE_SQL_PATH_BUF_SIZE)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file path");
+    LOG_WARN("invalid parquet path", K(ret), K(real_path));
+  } else {
+    MEMCPY(path_buf, real_path.ptr(), real_path.length());
+    path_buf[real_path.length()] = '\0';
+    ObIAllocator &alloc = ctx_.get_allocator();
+    if (OB_ISNULL(parquet_reader_)) {
+      void *mem = NULL;
+      if (NULL == (mem = alloc.alloc(sizeof(ObParquetReader)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to alloc the parquet reader", K(ret));
+      } else {
+        parquet_reader_ = new (mem) ObParquetReader(alloc);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(parquet_reader_->open(
+                   ObString(static_cast<int32_t>(strlen(path_buf)), path_buf)))) {
+      LOG_WARN("failed to open the parquet file", K(ret), K(real_path));
+    } else {
+      file_row_idx_ = 0;
+    }
+  }
+  return ret;
+}
+
+// One value per row, straight out of the column the reader decoded at open. The code generator
+// builds exactly one column expression per inferred column, so a parquet scan always has one.
+int ObFunctionTableOp::inner_get_next_row_parquet()
+{
+  int ret = OB_SUCCESS;
+  ObExpr *expr = MY_SPEC.column_exprs_.count() > 0 ? MY_SPEC.column_exprs_.at(0) : NULL;
+  if (OB_ISNULL(parquet_reader_)
+      || OB_UNLIKELY(1 != MY_SPEC.file_params_.inferred_column_count_)
+      || OB_UNLIKELY(MY_SPEC.column_exprs_.count() != 1) || OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected parquet file table state", K(ret), K(MY_SPEC.file_params_),
+             KP(parquet_reader_), "expr_cnt", MY_SPEC.column_exprs_.count());
+  } else {
+    ObObj value;
+    if (OB_FAIL(parquet_reader_->get_next_value(value))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to read the next parquet value", K(ret), K_(file_row_idx));
+      }
+    } else {
+      ++file_row_idx_;
+      ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+      if (OB_FAIL(datum.from_obj(value, expr->obj_datum_map_))) {
+        LOG_WARN("failed to write a parquet value", K(ret), K(value), K_(file_row_idx));
       } else {
         expr->set_evaluated_projected(eval_ctx_);
       }

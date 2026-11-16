@@ -19,6 +19,7 @@
 
 #include "sql/engine/ob_operator.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
+#include "sql/engine/basic/ob_parquet_reader.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/allocator/page_arena.h"
 
@@ -95,7 +96,8 @@ public:
     file_row_idx_(0),
     file_eof_(false),
     csv_parser_(nullptr),
-    file_json_scratch_("FileSqlJson")
+    file_json_scratch_("FileSqlJson"),
+    parquet_reader_(nullptr)
   {}
 
   virtual int inner_open() override;
@@ -117,6 +119,10 @@ private:
   // none of the opening or the parsing: the names it matches are collected once at open.
   int open_glob_reader();
   int inner_get_next_row_glob();
+  // A parquet scan takes its rows out of the column the reader decoded when it opened, so it uses
+  // neither the streaming buffer nor the field parser.
+  int open_parquet_reader();
+  int inner_get_next_row_parquet();
   int get_current_result(common::ObObj &result);
   int64_t node_idx_;
   bool already_calc_;
@@ -139,6 +145,9 @@ private:
   // the tree and the printed numbers of the json row being written, released one row early so the
   // datums of the previous row keep pointing at it until the next row starts
   common::ObArenaAllocator file_json_scratch_;
+  // the decoded column of a parquet scan, released in release_file_reader because the operator
+  // arena runs no destructor for it
+  ObParquetReader *parquet_reader_;
 };
 
 } // end namespace sql

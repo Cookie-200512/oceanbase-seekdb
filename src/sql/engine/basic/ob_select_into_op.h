@@ -71,7 +71,10 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      with_header_(false),
+      copy_null_str_(alloc),
+      copy_column_names_(alloc)
   {
   }
 
@@ -91,6 +94,11 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  // COPY only: the target column names are known before execution, so they travel as one '\0'
+  // separated blob, the same way the file table column names do.
+  bool with_header_;
+  ObExternalFileFormat::StringData copy_null_str_;
+  ObExternalFileFormat::StringData copy_column_names_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +134,8 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      copy_file_active_(false)
   {
   }
 
@@ -200,6 +209,10 @@ private:
   void set_csv_format_options();
 
   int get_row_str(const int64_t buf_len, bool is_first_row, char *buf, int64_t &pos);
+  // COPY opens its own target: an existing file is refused, and once the file exists a copy that
+  // fails has to remove it again.
+  int open_copy_file();
+  int write_copy_header(ObCsvFileWriter &data_writer);
   int into_dumpfile(ObExternalFileWriter *data_writer);
   int into_outfile(ObExternalFileWriter *data_writer);
   int into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFileWriter *data_writer);
@@ -269,6 +282,8 @@ private:
   ObObj field_str_;
   ObObj line_str_;
   ObObj file_name_;
+  // what a null cell becomes in a copy output file, which is the nullstr the statement named
+  ObObj copy_null_obj_;
   common::ObCollationType cs_type_;
   ObString basic_url_; // url without partition expr
   ObExternalFileWriter* data_writer_;
@@ -292,6 +307,8 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  // set once COPY has created its target, so a failed copy leaves no half written file behind
+  bool copy_file_active_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

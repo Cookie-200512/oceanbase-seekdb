@@ -3044,6 +3044,128 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
   return ret;
 }
 
+// COPY writes a file the session names, so it is gated by the same switch as the file table
+// functions and its target goes through the same secure_file_priv check. Only the output format and
+// the options the file_sql suite asks for are accepted; everything else is reported instead of
+// guessed at. The path kept on the item is the resolved one, so the file the executor opens is the
+// file that was checked here.
+int ObSelectResolver::resolve_into_copy_file(const ParseNode *node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  const ParseNode *path_node = NULL;
+  const ParseNode *opt_node = NULL;
+  ObString file_path;
+  ObString real_path;
+  bool has_format = false;
+  if (OB_ISNULL(node) || 2 != node->num_child_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected copy node", K(ret), K(node));
+  } else if (OB_FAIL(check_file_sql_enabled(enabled))) {
+    LOG_WARN("failed to check enable_file_sql", K(ret));
+  } else if (!enabled) {
+    // nothing below reads the target path
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function when enable_file_sql is off");
+    LOG_WARN("copy is disabled by enable_file_sql", K(ret));
+  } else if (OB_ISNULL(path_node = node->children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null copy target node", K(ret));
+  } else if (T_CHAR != path_node->type_ && T_VARCHAR != path_node->type_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "non-constant file path");
+    LOG_WARN("only string literal copy targets are supported", K(ret), K(path_node->type_));
+  } else if (OB_FALSE_IT(file_path.assign_ptr(path_node->str_value_,
+                                             static_cast<int32_t>(path_node->str_len_)))) {
+  } else if (file_path.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("empty copy target", K(ret));
+  } else if (OB_FAIL(check_file_table_path(file_path, real_path))) {
+    LOG_WARN("failed to check the copy target path", K(ret), K(file_path));
+  } else if (OB_FALSE_IT(opt_node = node->children_[1])) {
+  } else if (OB_NOT_NULL(opt_node) && T_EXPR_LIST != opt_node->type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected copy option node", K(ret), K(opt_node->type_));
+  } else {
+    into_item.outfile_name_.set_varchar(real_path);
+    into_item.outfile_name_.set_collation_type(ObCharset::get_system_collation());
+    into_item.field_str_.set_varchar(",");
+    into_item.field_str_.set_collation_type(ObCharset::get_system_collation());
+    into_item.line_str_.set_varchar("\n");
+    into_item.line_str_.set_collation_type(ObCharset::get_system_collation());
+    for (int64_t i = 0; OB_SUCC(ret) && OB_NOT_NULL(opt_node) && i < opt_node->num_child_; ++i) {
+      const ParseNode *opt = opt_node->children_[i];
+      if (OB_ISNULL(opt)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null copy option", K(ret), K(i));
+      } else if (T_COPY_FORMAT == opt->type_) {
+        const ParseNode *value = opt->num_child_ > 0 ? opt->children_[0] : NULL;
+        ObString format;
+        if (has_format) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("duplicated copy format option", K(ret), K(i));
+        } else if (OB_ISNULL(value) || OB_ISNULL(value->str_value_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid copy format value", K(ret), K(i));
+        } else if (OB_FALSE_IT(format.assign_ptr(value->str_value_,
+                                                 static_cast<int32_t>(value->str_len_)))) {
+        } else if (0 != format.case_compare("csv")) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "this copy output format");
+          LOG_WARN("copy output format is not implemented", K(ret), K(format));
+        } else {
+          has_format = true;
+        }
+      } else if (T_COPY_OPTION == opt->type_) {
+        const ParseNode *name_node = opt->num_child_ > 0 ? opt->children_[0] : NULL;
+        const ParseNode *value_node = opt->num_child_ > 1 ? opt->children_[1] : NULL;
+        ObString name;
+        if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_) || name_node->str_len_ <= 0) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid copy option name", K(ret), K(i));
+        } else if (OB_FALSE_IT(name.assign_ptr(name_node->str_value_,
+                                               static_cast<int32_t>(name_node->str_len_)))) {
+        } else if (0 == name.case_compare("header")) {
+          if (NULL != value_node) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "a value for the copy header option");
+            LOG_WARN("the copy header option takes no value", K(ret), K(name));
+          } else {
+            into_item.with_header_ = true;
+          }
+        } else if (0 == name.case_compare("nullstr")) {
+          if (OB_ISNULL(value_node)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("nullstr needs a value", K(ret), K(name));
+          } else if (T_CHAR != value_node->type_ && T_VARCHAR != value_node->type_) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "a non-string copy nullstr");
+            LOG_WARN("copy nullstr is not a string", K(ret), K(value_node->type_));
+          } else if (OB_FAIL(ob_write_string(*allocator_, ObString(value_node->str_len_,
+                                                                   value_node->str_value_),
+                                             into_item.null_str_))) {
+            LOG_WARN("failed to copy the nullstr value", K(ret));
+          }
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "this copy option");
+          LOG_WARN("unsupported copy option", K(ret), K(name));
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected copy option node type", K(ret), K(opt->type_));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!has_format) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "copy without an output format");
+      LOG_WARN("copy needs an explicit output format", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
                                                           ObSelectIntoItem &into_item)
 {
@@ -3114,6 +3236,10 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
         } else { // Be compatible with grammar before
           if (OB_FAIL(resolve_into_outfile_without_format(node, *into_item))) {
           }
+        }
+      } else if (T_COPY_TO_FILE == node->type_) { // copy (query) to 'file' (options)
+        if (OB_FAIL(resolve_into_copy_file(node, *into_item))) {
+          LOG_WARN("failed to resolve the copy target", K(ret));
         }
       } else if (T_INTO_DUMPFILE  == node->type_) { // into dumpfile
         if (is_in_set_query()) {

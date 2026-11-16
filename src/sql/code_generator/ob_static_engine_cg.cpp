@@ -5462,6 +5462,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
   } else {
     ObString var;
+    ObString copy_names;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_user_vars().count(); ++i) {
       var.reset();
       if (OB_FAIL(ob_write_string(alloc, op.get_user_vars().at(i), var))) {
@@ -5486,7 +5487,65 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.cs_type_ = op.get_cs_type();
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
+      spec.with_header_ = op.get_with_header();
       spec.plan_->need_drive_dml_query_ = true;
+      if (OB_FAIL(spec.copy_null_str_.store_str(op.get_null_str()))) {
+        LOG_WARN("failed to save the copy null string", K(ret));
+      } else if (!op.get_with_header()) {
+      } else if (OB_FAIL(generate_copy_column_names(op, copy_names))) {
+        LOG_WARN("failed to build the copy column names", K(ret));
+      } else if (OB_FAIL(spec.copy_column_names_.store_str(copy_names))) {
+        LOG_WARN("failed to save the copy column names", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+// The header line a COPY writes is made of the result column names, and those only exist as raw
+// expressions before code generation. They travel the way the file table column names do: one
+// '\0' separated blob, copied into the plan allocator so a cached plan owns its own bytes.
+int ObStaticEngineCG::generate_copy_column_names(ObLogSelectInto &op, common::ObString &names)
+{
+  int ret = OB_SUCCESS;
+  ObIAllocator &alloc = phy_plan_->get_allocator();
+  const ObDMLStmt *dml_stmt = op.get_stmt();
+  const ObSelectStmt *select_stmt = (OB_NOT_NULL(dml_stmt) && stmt::T_SELECT == dml_stmt->get_stmt_type())
+                                    ? static_cast<const ObSelectStmt *>(dml_stmt) : NULL;
+  names.reset();
+  if (OB_ISNULL(select_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected copy source statement", K(ret), K(dml_stmt));
+  } else {
+    const ObIArray<SelectItem> &items = select_stmt->get_select_items();
+    int64_t total = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+      const ObString &alias = items.at(i).alias_name_;
+      const ObString &expr_name = items.at(i).expr_name_;
+      const ObString &name = alias.empty() ? expr_name : alias;
+      if (name.empty()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("copy with header needs a named result column", K(ret), K(i), K(items.count()));
+      } else {
+        total += name.length() + 1;
+      }
+    }
+    char *buf = NULL;
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(total)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc the copy column names", K(ret), K(total));
+    } else {
+      int64_t pos = 0;
+      for (int64_t i = 0; i < items.count(); ++i) {
+        const ObString &alias = items.at(i).alias_name_;
+        const ObString &expr_name = items.at(i).expr_name_;
+        const ObString &name = alias.empty() ? expr_name : alias;
+        MEMCPY(buf + pos, name.ptr(), name.length());
+        pos += name.length();
+        buf[pos++] = '\0';
+      }
+      names.assign_ptr(buf, static_cast<int32_t>(total));
     }
   }
   return ret;

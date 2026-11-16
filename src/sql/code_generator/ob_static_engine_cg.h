@@ -379,6 +379,7 @@ private:
   int generate_spec(ObLogUpdate &op, ObPxMultiPartUpdateSpec &spec, const bool in_root_job);
   int generate_spec(ObLogInsert &op, ObPxMultiPartSSTableInsertSpec &spec, const bool in_root_job);
   int generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec, const bool in_root_job);
+  int generate_copy_column_names(ObLogSelectInto &op, common::ObString &names);
   int generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec &spec, const bool in_root_job);
   int generate_spec(ObLogJsonTable &op, ObJsonTableSpec &spec, const bool in_root_job);
 

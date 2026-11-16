@@ -343,6 +343,10 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
     ret_bool = true;
   } else if (T_FILE_TABLE_EXPRESSION == tree->type_) {
     ret_bool = true;
+  } else if (T_COPY_TO_FILE == tree->type_) {
+    // the copy resolver reads the target path and the options straight out of the parse tree, so
+    // turning either string into a placeholder would lose the file it was asked to write
+    ret_bool = true;
   } else {
     // do nothing
   }

@@ -42,6 +42,7 @@
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
 #include "sql/engine/cmd/ob_load_data_parser.h"
+#include "sql/engine/basic/ob_parquet_reader.h"
 
 namespace oceanbase
 {
@@ -4796,10 +4797,55 @@ static int file_sql_fill_glob_columns(common::ObIAllocator &alloc,
   return ret;
 }
 
+// A parquet file describes its own columns in the footer, so there is no value to sample and no
+// header line to read: the schema of the scan is the column list the file declares. Like the probes
+// of read_csv and read_json this is called from the else if chain of resolve_file_table_item, where
+// a successful call has to leave the chain running so that the table item still gets created.
+static int file_sql_fill_parquet_columns(const common::ObString &real_path,
+                                         common::ObIAllocator &alloc,
+                                         common::ObIArray<ObDMLResolver::FileSqlColumnSample> &samples,
+                                         common::ObIArray<common::ObString> &names, int64_t &col_cnt)
+{
+  int ret = OB_SUCCESS;
+  ObParquetReader reader(alloc);
+  ObSEArray<ObParquetReader::ColumnSchema, 8> cols;
+  col_cnt = 0;
+  if (OB_FAIL(reader.open(real_path))) {
+    LOG_WARN("failed to open the parquet file", K(ret), K(real_path));
+  } else if (OB_FAIL(reader.get_schema(cols))) {
+    LOG_WARN("failed to read the parquet schema", K(ret), K(real_path));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < cols.count(); ++i) {
+      ObDMLResolver::FileSqlColumnSample sample;
+      ObString name;
+      // An int32 column lands on the bigint rung of the ladder, and the nullability the file
+      // declares for the column is what a describe of it has to answer with.
+      if (ObIntType != cols.at(i).type_) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "this parquet column type");
+        LOG_WARN("parquet column type is not supported", K(ret), K(i), K(cols.at(i)));
+      } else if (OB_FALSE_IT(sample.type_level_ = FILE_SQL_TYPE_LEVEL_BIGINT)) {
+      } else if (OB_FALSE_IT(sample.seen_null_ = cols.at(i).nullable_)) {
+      } else if (OB_FAIL(ob_write_string(alloc, cols.at(i).name_, name))) {
+        LOG_WARN("failed to copy the parquet column name", K(ret));
+      } else if (OB_FAIL(samples.push_back(sample))) {
+        LOG_WARN("failed to add the parquet column sample", K(ret));
+      } else if (OB_FAIL(names.push_back(name))) {
+        LOG_WARN("failed to add the parquet column name", K(ret));
+      } else {
+        ++col_cnt;
+      }
+    }
+  }
+  // the names were copied out of the file image, so nothing below keeps a pointer into it
+  reader.close();
+  return ret;
+}
+
 // Resolves read_csv/read_json/read_parquet/glob in table position. read_csv and read_json probe the
 // file and become a function table whose columns are the inferred ones, glob becomes one that has
-// only the file column the pattern is listed into, and read_parquet still reports the scan as not
-// supported.
+// only the file column the pattern is listed into, and read_parquet becomes one whose columns and
+// types are the ones the file footer declares.
 int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item)
 {
   int ret = OB_SUCCESS;
@@ -4837,7 +4883,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   } else if (OB_FAIL(check_file_table_path(file_path, real_path))) {
     LOG_WARN("failed to check file table path", K(ret), K(file_path));
   } else if (FILE_SQL_READ_CSV != parse_tree.value_ && FILE_SQL_READ_JSON != parse_tree.value_
-             && FILE_SQL_GLOB != parse_tree.value_) {
+             && FILE_SQL_READ_PARQUET != parse_tree.value_ && FILE_SQL_GLOB != parse_tree.value_) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading files as tables");
     LOG_WARN("file table scan is not implemented yet", K(ret), K(file_path), K(parse_tree.value_));
@@ -4855,14 +4901,20 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     } else if (FILE_SQL_GLOB == parse_tree.value_
                && OB_FAIL(file_sql_fill_glob_columns(*allocator_, samples, probe_names, col_cnt))) {
       LOG_WARN("failed to fill the glob column", K(ret));
+    } else if (FILE_SQL_READ_PARQUET == parse_tree.value_
+               && OB_FAIL(file_sql_fill_parquet_columns(real_path, *allocator_, samples,
+                                                        probe_names, col_cnt))) {
+      LOG_WARN("failed to read the parquet schema", K(ret), K(real_path));
     } else if (FILE_SQL_READ_JSON == parse_tree.value_
                && OB_FAIL(scan_prefix_json_rows(real_path, file_def, *allocator_, col_cnt,
                                                 samples, probe_names))) {
       LOG_WARN("failed to probe the jsonl file", K(ret), K(real_path));
     } else if (FILE_SQL_READ_JSON != parse_tree.value_
                // A glob filled its one column above and has no file to probe, and its pattern is
-               // not a name that can be opened, so the csv probe must not run for it.
+               // not a name that can be opened, so the csv probe must not run for it. A parquet
+               // file took its columns from the footer the same way, and its bytes are not rows.
                && FILE_SQL_GLOB != parse_tree.value_
+               && FILE_SQL_READ_PARQUET != parse_tree.value_
                && OB_FAIL(scan_prefix_rows(real_path, file_def, *allocator_, col_cnt, samples,
                                            probe_names))) {
       LOG_WARN("failed to probe the csv file", K(ret), K(real_path));
